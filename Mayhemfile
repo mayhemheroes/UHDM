@@ -1,6 +1,6 @@
-project: rnshah9/uhdm
+project: uhdm
 target: uhdm-dump
-tests: 
+testsuite: 
   - file://surelog.uhdm
 
 cmds:
