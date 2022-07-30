@@ -4,4 +4,4 @@ testsuite:
   - file://surelog.uhdm
 
 cmds:
-  - cmd: /repo/build/bin/uhdm-dump @@
+  - cmd: /install/usr/local/bin/uhdm-dump @@
