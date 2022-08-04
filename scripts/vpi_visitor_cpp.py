@@ -9,13 +9,9 @@ def _get_implementation(classname, vpi, card):
     if card == '1':
         shallow_visit = 'false'
 
-        if vpi in ['vpiInstance', 'vpiModule', 'vpiInterface', 'vpiUse', 'vpiProgram', 'vpiClassDefn', 'vpiPackage', 'vpiUdp']:
+        if vpi in ['vpiParent', 'vpiInstance', 'vpiModule', 'vpiInterface', 'vpiUse', 'vpiProgram', 'vpiClassDefn', 'vpiPackage', 'vpiUdp']:
             # Prevent walking upwards and makes the UHDM output cleaner
             # Prevent loop in Standard VPI
-            shallow_visit = 'true'
-
-        if '_select' not in classname and vpi == 'vpiParent':
-            # Print shallow for all but '_select' parents
             shallow_visit = 'true'
 
         if 'func_call' in classname and vpi == 'vpiFunction':
@@ -24,6 +20,10 @@ def _get_implementation(classname, vpi, card):
 
         if 'task_call' in classname and vpi == 'vpiTask':
             # Prevent stepping inside tasks while processing calls (task_call, method_task_call) to them
+            shallow_visit = 'true'
+
+        if classname in ['ref_obj']:
+            # Ref_obj are always printed shallow
             shallow_visit = 'true'
 
         content.append(f'  if (vpiHandle itr = vpi_handle({vpi}, obj_h)) {{')
@@ -62,10 +62,10 @@ def _get_vpi_xxx_visitor(type, vpi, card):
     elif (card == '1') and (vpi not in ['vpiType', 'vpiFile', 'vpiLineNo', 'vpiColumnNo', 'vpiEndLineNo', 'vpiEndColumnNo']):
         if type == 'string':
             content.append(f'  if (const char* s = vpi_get_str({vpi}, obj_h))')
-            content.append(f'    stream_indent(out, indent) << "|{vpi}:" << s << std::endl;')
+            content.append(f'    stream_indent(out, indent) << "|{vpi}:" << s << "\\n";') # no std::endl, avoid flush
         else:
             content.append(f'  if (const int n = vpi_get({vpi}, obj_h))')
-            content.append(f'    stream_indent(out, indent) << "|{vpi}:" << n << std::endl;')
+            content.append(f'    stream_indent(out, indent) << "|{vpi}:" << n << "\\n";') # no std::endl, avoid flush
     return content
 
 
@@ -90,12 +90,15 @@ def generate(models):
 
         private_visitor_bodies.append(f'static void visit_{classname}(vpiHandle obj_h, int indent, const char *relation, VisitedContainer* visited, std::ostream& out, bool shallowVisit) {{')
 
+        # Make sure vpiParent is called before the base class visit.
+        if modeltype != 'class_def':
+            private_visitor_bodies.extend(_get_implementation(classname, 'vpiParent', '1'))
+
         baseclass = model.get('extends', None)
         if baseclass:
             private_visitor_bodies.append(f'  visit_{baseclass}(obj_h, indent, relation, visited, out, shallowVisit);')
 
         if modeltype != 'class_def':
-            private_visitor_bodies.extend(_get_implementation(classname, 'vpiParent', '1'))
             private_visitor_bodies.extend(_get_vpi_xxx_visitor('string', 'vpiFile', '1'))
         
         type_specified = False

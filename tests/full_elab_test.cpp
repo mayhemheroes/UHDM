@@ -31,8 +31,10 @@
 #include "gtest/gtest.h"
 #include "uhdm/ElaboratorListener.h"
 #include "uhdm/uhdm.h"
-#include "uhdm/vpi_listener.h"
+#include "uhdm/VpiListener.h"
 #include "uhdm/vpi_visitor.h"
+
+#include "test_util.h"
 
 using namespace UHDM;
 
@@ -188,7 +190,7 @@ std::string dumpStats(const Serializer& serializer) {
 TEST(FullElabTest, ElaborationRoundtrip) {
   Serializer serializer;
   const std::vector<vpiHandle>& designs = build_designs(&serializer);
-  const std::string before = visit_designs(designs);
+  const std::string before = designs_to_string(designs);
 
   bool elaborated = false;
   for (auto design : designs) {
@@ -205,7 +207,7 @@ TEST(FullElabTest, ElaborationRoundtrip) {
             "ref_obj 4\n");
 
   ElaboratorListener* listener = new ElaboratorListener(&serializer, true);
-  listen_designs(designs, listener);
+  listener->listenDesigns(designs);
   delete listener;
 
   elaborated = false;
@@ -216,6 +218,6 @@ TEST(FullElabTest, ElaborationRoundtrip) {
 
   // TODO: this needs more fine-grained object-level inspection.
 
-  const std::string after = visit_designs(designs);
+  const std::string after = designs_to_string(designs);
   EXPECT_NE(before, after);  // We expect the elaboration to have some impact :)
 }

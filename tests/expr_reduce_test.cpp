@@ -23,7 +23,6 @@
  */
 
 #include <iostream>
-#include <map>
 #include <stack>
 #include <string>
 #include <vector>
@@ -31,9 +30,11 @@
 #include "gtest/gtest.h"
 #include "uhdm/ElaboratorListener.h"
 #include "uhdm/uhdm.h"
-#include "uhdm/vpi_listener.h"
+#include "uhdm/VpiListener.h"
 #include "uhdm/vpi_visitor.h"
 #include "uhdm/ExprEval.h"
+
+#include "test_util.h"
 
 using namespace UHDM;
 
@@ -95,7 +96,7 @@ std::vector<vpiHandle> build_designs(Serializer* s) {
 TEST(FullElabTest, ElaborationRoundtrip) {
   Serializer serializer;
   const std::vector<vpiHandle>& designs = build_designs(&serializer);
-  const std::string before = visit_designs(designs);
+  const std::string before = designs_to_string(designs);
 
   bool elaborated = false;
   for (auto design : designs) {
@@ -104,7 +105,7 @@ TEST(FullElabTest, ElaborationRoundtrip) {
   EXPECT_FALSE(elaborated);
 
   ElaboratorListener* listener = new ElaboratorListener(&serializer, true);
-  listen_designs(designs, listener);
+  listener->listenDesigns(designs);
   delete listener;
 
   elaborated = false;

@@ -41,7 +41,6 @@
 #endif
 
 #include <iostream>
-#include <map>
 #include <string>
 #include <vector>
 
@@ -65,8 +64,11 @@ void Serializer::SetSaveId_(FactoryT<T> *const factory) {
 
 struct Serializer::SaveAdapter {
   void operator()(const BaseClass *const obj, Serializer *const serializer, Any::Builder builder) const {
-    builder.setVpiParent(serializer->GetId(obj->VpiParent()));
-    builder.setUhdmParentType(obj->UhdmParentType());
+    if (obj->VpiParent() != nullptr) {
+      ::ObjIndexType::Builder vpiParentBuilder = builder.getVpiParent();
+      vpiParentBuilder.setIndex(serializer->GetId(obj->VpiParent()));
+      vpiParentBuilder.setType(obj->VpiParent()->UhdmType());
+    }
     builder.setVpiFile(obj->GetSerializer()->symbolMaker.Make(obj->VpiFile().string()));
     builder.setVpiLineNo(obj->VpiLineNo());
     builder.setVpiColumnNo(obj->VpiColumnNo());
@@ -78,7 +80,7 @@ struct Serializer::SaveAdapter {
 <CAPNP_SAVE_ADAPTERS>
 
   template<typename T, typename U, typename = typename std::enable_if<std::is_base_of<BaseClass, T>::value>::type>
-  void operator()(const std::vector<T*> &objects, Serializer *serializer, typename ::capnp::List<U>::Builder builder) const {
+  void operator()(const typename FactoryT<T>::objects_t &objects, Serializer *serializer, typename ::capnp::List<U>::Builder builder) const {
     unsigned long index = 0;
     for (const T* obj : objects)
       operator()(obj, serializer, builder[index++]);
@@ -111,7 +113,7 @@ void Serializer::Save(const std::string& file) {
   // Until that is repaired we go for the more disk-hungry and memory hungry method which gives correct results.
   ::capnp::List<::capnp::Text>::Builder symbols = cap_root.initSymbols(symbolMaker.id2SymbolMap_.size());
   index = 0;
-  for (auto symbol : symbolMaker.id2SymbolMap_) {
+  for (const auto& symbol : symbolMaker.id2SymbolMap_) {
     symbols.set(index, symbol.c_str());
     index++;
   }
@@ -119,8 +121,8 @@ void Serializer::Save(const std::string& file) {
   writePackedMessageToFd(fileid, message);
   close(fileid);
 }
+}  // namespace UHDM
 
 #if defined(_MSC_VER)
   #pragma warning(pop)
 #endif
-}  // namespace UHDM

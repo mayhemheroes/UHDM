@@ -74,9 +74,13 @@ class FactoryT;
 
 class Serializer {
  public:
+  using IdMap = std::map<const BaseClass*, unsigned long>;
+
   Serializer() : incrId_(0), objId_(0), errorHandler(DefaultErrorHandler) {
     symbolMaker.Make("");
   }
+  ~Serializer();
+
   void Save(const std::string& file);
   void Purge();
   void SetErrorHandler(ErrorHandler handler) { errorHandler = handler; }
@@ -104,7 +108,7 @@ class Serializer {
   uhdm_handleFactory uhdm_handleMaker;
 <FACTORY_DATA_MEMBERS>
 
-  const std::map<const BaseClass*, unsigned long>& AllObjects() const {
+  const IdMap& AllObjects() const {
     return allIds_;
   }
 
@@ -127,7 +131,7 @@ class Serializer {
   BaseClass* GetObject(unsigned int objectType, unsigned int index);
   void SetId(const BaseClass* p, unsigned long id);
   unsigned long GetId(const BaseClass* p);
-  std::map<const BaseClass*, unsigned long> allIds_;
+  IdMap allIds_;
   unsigned long incrId_;  // Capnp id
   unsigned long objId_;   // ID for property annotations
 

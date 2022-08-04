@@ -43,19 +43,15 @@ void DefaultErrorHandler(ErrorType errType, const std::string& errorMsg, const a
 }
 
 void Serializer::SetId(const BaseClass* p, unsigned long id) {
-  allIds_.insert(std::make_pair(p, id));
+  allIds_.emplace(p, id);
 }
 
 unsigned long Serializer::GetId(const BaseClass* p) {
-  std::map<const BaseClass*, unsigned long>::iterator itr = allIds_.find(p);
-  if (itr == allIds_.end()) {
-    unsigned long tmp = incrId_;
-    allIds_.insert(std::make_pair(p, incrId_));
-    incrId_++;
-    return tmp;
-  } else {
-    return (*itr).second;
+  auto inserted = allIds_.emplace(p, incrId_);
+  if (inserted.second) {
+    ++incrId_;
   }
+  return inserted.first->second;
 }
 
 <UHDM_NAME_MAP>
@@ -85,6 +81,10 @@ std::map<std::string, unsigned long> Serializer::ObjectStats() const {
   return stats;
 }
 
+Serializer::~Serializer() {
+  Purge();
+}
+
 void Serializer::Purge() {
   allIds_.clear();
   anyVectMaker.Purge();
@@ -94,6 +94,6 @@ void Serializer::Purge() {
 }
 }  // namespace UHDM
 
-#if (defined(_MSC_VER) || defined(__MINGW32__) || defined(__CYGWIN__))
+#if defined(_MSC_VER)
   #pragma warning(pop)
 #endif

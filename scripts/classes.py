@@ -16,7 +16,7 @@ def _get_declarations(classname, type, vpi, card, real_type=''):
 
     final = ''
     virtual = ''
-    if vpi in ['vpiParent', 'uhdmParentType', 'uhdmType', 'vpiLineNo', 'vpiColumnNo', 'vpiEndLineNo', 'vpiEndColumnNo', 'vpiFile', 'vpiName', 'vpiDefName', 'uhdmId']:
+    if vpi in ['vpiParent', 'uhdmType', 'vpiLineNo', 'vpiColumnNo', 'vpiEndLineNo', 'vpiEndColumnNo', 'vpiFile', 'vpiName', 'vpiDefName', 'uhdmId']:
         final = ' final'
         virtual = 'virtual '
 
@@ -43,10 +43,7 @@ def _get_declarations(classname, type, vpi, card, real_type=''):
             content.append(f'  {virtual}const std::string& {Vpi_}() const{final};')
         else:
             content.append(f'  {virtual}{const}{type}{pointer} {Vpi_}() const{final} {{ return {vpi}_; }}')
-            if vpi == 'vpiParent':
-                content.append(f'  virtual bool {Vpi_}({type}{pointer} data) final {{ {check}{vpi}_ = data; uhdmParentType_ = (data != nullptr) ? data->UhdmType() : 0; return true; }}')
-            else:
-                content.append(f'  {virtual}bool {Vpi_}({type}{pointer} data){final} {{ {check}{vpi}_ = data; return true; }}')
+            content.append(f'  {virtual}bool {Vpi_}({type}{pointer} data){final} {{ {check}{vpi}_ = data; return true; }}')
     elif card == 'any':
         content.append(f'  VectorOf{type}* {Vpi_}() const {{ return {vpi}_; }}')
         content.append(f'  bool {Vpi_}(VectorOf{type}* data) {{ {check}{vpi}_ = data; return true; }}')
@@ -178,14 +175,15 @@ def _get_data_member(type, vpi, card):
 
 def _get_DeepClone_implementation(model, models):
     classname = model.get('name')
-
+    modeltype = model.get('type')
+    Classname = classname[0].upper() + classname[1:]
     includes = set()
     content = []
     content.append(f'void {classname}::DeepCopy({classname}* clone, Serializer* serializer, ElaboratorListener* elaborator, BaseClass* parent) const {{')
+    if modeltype != 'class_def':
+        content.append(f'  elaborator->enter{Classname}(clone,nullptr);')
     content.append(f'  basetype_t::DeepCopy(clone, serializer, elaborator, parent);')
-    modeltype = model.get('type')
     basename = model.get('extends', 'BaseClass')
-    Classname = classname[0].upper() + classname[1:]
     vpi_name = config.make_vpi_name(classname)
 
     if classname in ['part_select', 'bit_select', 'indexed_part_select']:
@@ -229,10 +227,33 @@ def _get_DeepClone_implementation(model, models):
 
             # Unary relations
             if card == '1':
-                if (classname in ['ref_obj', 'ref_var']) and (method == 'Actual_group'):
+                if (classname in ['ref_obj', 'ref_var', 'part_select']) and (method == 'Actual_group'):
                     includes.add('ElaboratorListener')
                     content.append(f'  clone->{method}(elaborator->bindAny(VpiName()));')
                     content.append(f'  if (!clone->{method}()) clone->{method}((any*) {method}());')
+
+                elif (classname in ['bit_select']) and (method == 'Actual_group'):
+                    includes.add('ElaboratorListener')
+                    includes.add('ExprEval')
+                    content.append(f'  std::string name = VpiName();')
+                    content.append(f'  ExprEval eval;')
+                    content.append(f'  bool invalidValue = false;')
+                    content.append( '  if (any* val = eval.reduceExpr(VpiIndex(), invalidValue, parent, parent, true)) {')
+                    content.append(f'    std::string indexName = eval.prettyPrint(val);')
+                    content.append( '    if (any* indexVal = elaborator->bindAny(indexName)) {')
+                    content.append(f'      val = eval.reduceExpr(indexVal, invalidValue, parent, parent, true);')
+                    content.append(f'      indexName = eval.prettyPrint(val);')
+                    content.append( '    }')
+                    content.append( '    indexName = name + "[" + indexName + "]";')
+                    content.append(f'    clone->{method}(elaborator->bindAny(indexName));')
+                    content.append( '  }')
+                    content.append(f'  if (!clone->{method}()) clone->{method}(elaborator->bindAny(name));')
+                    content.append(f'  if (!clone->{method}()) clone->{method}((any*) {method}());')
+
+                elif classname == 'udp' and method == 'Udp_defn':
+                    includes.add('ElaboratorListener')
+                    content.append(f'  clone->{method}((udp_defn*) elaborator->bindAny(VpiDefName()));')
+                    content.append(f'  if (!clone->{method}()) clone->{method}((udp_defn*) {method}());')
 
                 elif method in ['Task', 'Function']:
                     prefix = 'nullptr'
@@ -251,6 +272,12 @@ def _get_DeepClone_implementation(model, models):
                 elif classname == 'disable' and method == 'VpiExpr':
                     includes.add('expr')
                     content.append(f'  if (auto obj = {method}()) clone->{method}((expr*) obj);')
+
+                elif classname == 'ports' and method == 'High_conn':
+                    content.append(f'  if (auto obj = {method}())')
+                    content.append('    { elaborator->ignoreLastInstance(true); ')
+                    content.append(f'      clone->{method}(obj->DeepClone(serializer, elaborator, clone));')
+                    content.append('      elaborator->ignoreLastInstance(false); }')
 
                 elif classname == 'int_typespec' and method == 'Cast_to_expr':
                     includes.add('variables')
@@ -319,6 +346,8 @@ def _get_DeepClone_implementation(model, models):
                 content.append( '      clone_vec->push_back(obj->DeepClone(serializer, elaborator, clone));')
                 content.append( '    }')
                 content.append( '  }')
+    if modeltype != 'class_def':
+          content.append(f'  elaborator->leave{Classname}(clone,nullptr);')
     content.append('}')
     content.append('')
 
@@ -330,8 +359,8 @@ def _get_DeepClone_implementation(model, models):
         content.append(f'{classname}* {classname}::DeepClone(Serializer* serializer, ElaboratorListener* elaborator, BaseClass* parent) const {{')
 
         if classname in ['begin', 'named_begin', 'fork', 'named_fork']:
-            content.append(f'  elaborator->enter{Classname}(this, parent, nullptr, nullptr);')
-        
+            content.append(f'  elaborator->enter{Classname}(this, nullptr);')
+
         if 'Net' in vpi_name:
             includes.add('ElaboratorListener')
             content.append(f'  {classname}* clone = any_cast<{classname}*>(elaborator->bindNet(VpiName()));')
@@ -356,7 +385,7 @@ def _get_DeepClone_implementation(model, models):
         content.append('  DeepCopy(clone, serializer, elaborator, parent);')
         
         if classname in ['begin', 'named_begin', 'fork', 'named_fork']:
-            content.append(f'  elaborator->leave{Classname}(this, parent, nullptr, nullptr);')
+            content.append(f'  elaborator->leave{Classname}(this, nullptr);')
 
         content.append('  return clone;')
         content.append('}')
@@ -698,12 +727,6 @@ def _generate_one_class(model, models, templates):
         data_members.extend(_get_data_member('BaseClass', 'vpiParent', '1'))
         declarations.extend(_get_declarations(classname, 'BaseClass', 'vpiParent', '1'))
         func_body, func_includes = _get_implementations(classname, 'BaseClass', 'vpiParent', '1')
-        implementations.extend(func_body)
-        includes.update(func_includes)
-
-        data_members.extend(_get_data_member('unsigned int', 'uhdmParentType', '1'))
-        declarations.extend(_get_declarations(classname, 'unsigned int', 'uhdmParentType', '1'))
-        func_body, func_includes = _get_implementations(classname, 'unsigned int', 'uhdmParentType', '1')
         implementations.extend(func_body)
         includes.update(func_includes)
 

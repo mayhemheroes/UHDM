@@ -23,16 +23,12 @@
  */
 
 #include <iostream>
-#include <map>
 #include <stack>
 #include <string>
 #include <vector>
 
 #include "gtest/gtest.h"
-#include "uhdm/ElaboratorListener.h"
 #include "uhdm/uhdm.h"
-#include "uhdm/vpi_listener.h"
-#include "uhdm/vpi_visitor.h"
 
 using namespace UHDM;
 
