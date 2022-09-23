@@ -8,5 +8,8 @@ WORKDIR /repo
 ENV DESTDIR=/install
 RUN make -j8
 RUN make install
+
 FROM ubuntu:22.04 as package
 COPY --from=builder /install /install
+RUN mkdir /testsuite
+COPY --from=builder /repo/surelog.uhdm /testsuite
