@@ -1,7 +1,5 @@
 project: uhdm
 target: uhdm-dump
-testsuite: 
-  - file://surelog.uhdm
 
 cmds:
   - cmd: /install/usr/local/bin/uhdm-dump @@
