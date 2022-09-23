@@ -8,6 +8,11 @@ WORKDIR /repo
 ENV DESTDIR=/install
 RUN make -j8
 RUN make install
+RUN make test
+
+WORKDIR /
+RUN mkdir /testsuite
+RUN cp /tmp/*.uhdm /testsuite
 
 FROM ubuntu:22.04 as package
 COPY --from=builder /install /install
