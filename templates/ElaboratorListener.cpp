@@ -1502,7 +1502,7 @@ void ElaboratorListener::leaveRef_obj(const ref_obj* object, vpiHandle handle) {
   // Logic net are the default binding (When no proper binding was found).
   // Hier path binding leaf node is more accurately done in the clone_tree operation
   // because of variable name scope shadowing issues. 
-  if ((!actual) || (actual && parent->UhdmType() != uhdmhier_path)) {
+  if ((!actual) || (actual && parent && parent->UhdmType() != uhdmhier_path)) {
     if (any* res = bindAny(object->VpiName())) {
       ((ref_obj*)object)->Actual_group(res);
     }
