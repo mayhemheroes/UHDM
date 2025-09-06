@@ -1496,11 +1496,17 @@ void ElaboratorListener::leaveMethod_func_call(const method_func_call* object,
 }
 
 void ElaboratorListener::leaveRef_obj(const ref_obj* object, vpiHandle handle) {
-  // if (!((ref_obj*)object)->Actual_group()) {
-  if (any* res = bindAny(object->VpiName())) {
-    ((ref_obj*)object)->Actual_group(res);
+  const any* actual = (any_cast<ref_obj*>(object))->Actual_group();
+  const any* parent = object->VpiParent();
+  // Last call binding happens here.
+  // Logic net are the default binding (When no proper binding was found).
+  // Hier path binding leaf node is more accurately done in the clone_tree operation
+  // because of variable name scope shadowing issues. 
+  if ((!actual) || (actual && parent->UhdmType() != uhdmhier_path)) {
+    if (any* res = bindAny(object->VpiName())) {
+      ((ref_obj*)object)->Actual_group(res);
+    }
   }
-  //}
 }
 
 void ElaboratorListener::leaveBit_select(const bit_select* object,
