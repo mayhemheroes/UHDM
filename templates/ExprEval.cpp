@@ -4370,6 +4370,25 @@ expr *ExprEval::reduceExpr(const any *result, bool &invalidValue,
     const std::string_view name = ref->VpiName();
     if (any *tmp = getValue(name, inst, pexpr, muteError)) {
       result = tmp;
+    } else if (const any *actual = ref->Actual_group()) {
+      // Fallback: use the elaborated Actual pointer to resolve the value
+      // This handles parameters/localparams in generate scopes that
+      // can't be found by name lookup alone
+      if (const parameter *param = any_cast<const parameter *>(actual)) {
+        std::string_view val = param->VpiValue();
+        if (!val.empty()) {
+          bool tmpInvalid = false;
+          get_value(tmpInvalid, (const expr *)param);
+          if (!tmpInvalid) {
+            constant *c = s.MakeConstant();
+            c->VpiValue(std::string(val));
+            c->VpiDecompile(param->VpiDecompile());
+            c->VpiSize(param->VpiSize());
+            c->VpiConstType(param->VpiConstType());
+            result = c;
+          }
+        }
+      }
     }
     return (expr *)result;
   } else if (objtype == UHDM_OBJECT_TYPE::uhdmhier_path) {

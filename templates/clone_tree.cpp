@@ -29,6 +29,45 @@
 
 namespace UHDM {
 
+// Evaluate an index expression to a numeric value, following Actual_group()
+// pointers on ref_obj elements to resolve parameters/localparams.
+// Returns true if successful, false if the expression can't be evaluated.
+static bool evalIndex(const expr* index, int64_t& result) {
+  if (!index) return false;
+  auto type = index->UhdmType();
+  if (type == UHDM_OBJECT_TYPE::uhdmconstant) {
+    bool inv = false;
+    ExprEval eval;
+    result = eval.get_value(inv, index);
+    return !inv;
+  } else if (type == UHDM_OBJECT_TYPE::uhdmref_obj) {
+    const ref_obj* ref = any_cast<const ref_obj*>(index);
+    if (const any* actual = ref->Actual_group()) {
+      if (const parameter* param = any_cast<const parameter*>(actual)) {
+        bool inv = false;
+        ExprEval eval;
+        result = eval.get_value(inv, (const expr*)param);
+        return !inv;
+      }
+    }
+    return false;
+  } else if (type == UHDM_OBJECT_TYPE::uhdmoperation) {
+    const operation* op = any_cast<const operation*>(index);
+    if (!op->Operands() || op->Operands()->size() < 2) return false;
+    int64_t lhs = 0, rhs = 0;
+    if (!evalIndex((const expr*)(*op->Operands())[0], lhs)) return false;
+    if (!evalIndex((const expr*)(*op->Operands())[1], rhs)) return false;
+    switch (op->VpiOpType()) {
+      case vpiAddOp: result = lhs + rhs; return true;
+      case vpiSubOp: result = lhs - rhs; return true;
+      case vpiMultOp: result = lhs * rhs; return true;
+      case vpiDivOp: if (rhs == 0) return false; result = lhs / rhs; return true;
+      default: return false;
+    }
+  }
+  return false;
+}
+
 BaseClass* clone_tree(const BaseClass* root, CloneContext* context) {
   return root ? root->DeepClone(nullptr, context) : nullptr;
 }
@@ -918,12 +957,24 @@ hier_path* hier_path::DeepClone(BaseClass* parent,
           }
         }
         std::string nameIndexed(name);
+        std::string nameResolved;
         if (obj->UhdmType() == UHDM_OBJECT_TYPE::uhdmbit_select) {
           bit_select* bs = static_cast<bit_select*>(obj);
           const expr* index = bs->VpiIndex();
           std::string_view indexName = index->VpiDecompile();
           if (!indexName.empty()) {
             nameIndexed.append("[").append(indexName).append("]");
+          }
+          // Also try to evaluate the index numerically for gen_scope_array
+          // matching, since symbolic names like "outer[LAST_START]" won't
+          // match gen_scope_array names like "outer[0]"
+          bit_select* cloned_bs = static_cast<bit_select*>(current);
+          if (const expr* cloned_index = cloned_bs->VpiIndex()) {
+            int64_t indexVal = 0;
+            if (evalIndex(cloned_index, indexVal)) {
+              nameResolved = std::string(name) + "[" +
+                             std::to_string(indexVal) + "]";
+            }
           }
         }
         if (ref_obj* pro = any_cast<ref_obj*>(previous)) {
@@ -1031,7 +1082,9 @@ hier_path* hier_path::DeepClone(BaseClass* parent,
                   if (!found && scope->Gen_scope_arrays()) {
                     for (auto gsa : *scope->Gen_scope_arrays()) {
                       if (gsa->VpiName() == name ||
-                          gsa->VpiName() == nameIndexed) {
+                          gsa->VpiName() == nameIndexed ||
+                          (!nameResolved.empty() &&
+                           gsa->VpiName() == nameResolved)) {
                         if (!gsa->Gen_scopes()->empty()) {
                           auto gs = gsa->Gen_scopes()->front();
                           if (ref_obj* cro = any_cast<ref_obj*>(current)) {
@@ -1351,7 +1404,9 @@ hier_path* hier_path::DeepClone(BaseClass* parent,
                 if (!found && mod->Gen_scope_arrays()) {
                   for (auto gsa : *mod->Gen_scope_arrays()) {
                     if (gsa->VpiName() == name ||
-                        gsa->VpiName() == nameIndexed) {
+                        gsa->VpiName() == nameIndexed ||
+                        (!nameResolved.empty() &&
+                         gsa->VpiName() == nameResolved)) {
                       if (!gsa->Gen_scopes()->empty()) {
                         auto gs = gsa->Gen_scopes()->front();
                         if (ref_obj* cro = any_cast<ref_obj*>(current)) {
