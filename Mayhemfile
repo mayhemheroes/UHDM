@@ -1,0 +1,5 @@
+project: uhdm
+target: uhdm-dump
+
+cmds:
+  - cmd: /install/usr/local/bin/uhdm-dump @@

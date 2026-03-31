@@ -1,0 +1,19 @@
+FROM --platform=linux/amd64 ubuntu:22.04 as builder
+
+RUN apt-get update
+RUN DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake git python3 python3-orderedmultidict
+
+COPY . /repo
+WORKDIR /repo
+ENV DESTDIR=/install
+RUN make -j8
+RUN make install
+RUN make test
+
+WORKDIR /
+RUN mkdir /testsuite
+RUN cp /tmp/*.uhdm /testsuite
+
+FROM ubuntu:22.04 as package
+COPY --from=builder /install /install
+COPY --from=builder /testsuite /testsuite
