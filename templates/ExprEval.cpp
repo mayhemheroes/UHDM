@@ -2770,44 +2770,64 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
             }
           }
           if (tps) {
-            if (tps->UhdmType() ==
-                UHDM_OBJECT_TYPE::uhdmpacked_array_typespec) {
-              packed_array_typespec *tmp = (packed_array_typespec *)tps;
-              if (const ref_typespec *rt = tmp->Elem_typespec()) {
-                tps = rt->Actual_typespec();
+            // `tps` is the DECLARED type of the ROOT base (select_path[0]).
+            // Walk the already-consumed path elements (select_path[1..level-1])
+            // down to the type that directly contains `elemName`, honoring both
+            // struct-member descents (e.g. `CFG.HSK.DLY` where `HSK` is a nested
+            // struct) and array-index tokens `[N]` (e.g. `FP_ENCODINGS[fmt]
+            // .exp_bits`, where the element type must be unwrapped).  Computing
+            // the containing struct lets a POSITIONAL pattern operand be indexed
+            // by member order below.
+            const typespec *cur = tps;
+            auto unwrapArray = [](const typespec *t) -> const typespec * {
+              if (t->UhdmType() == UHDM_OBJECT_TYPE::uhdmpacked_array_typespec) {
+                if (const ref_typespec *rt =
+                        ((packed_array_typespec *)t)->Elem_typespec())
+                  return rt->Actual_typespec();
+                return nullptr;
+              } else if (t->UhdmType() == UHDM_OBJECT_TYPE::uhdmarray_typespec) {
+                if (const ref_typespec *rt =
+                        ((array_typespec *)t)->Elem_typespec())
+                  return rt->Actual_typespec();
+                return nullptr;
               }
-            } else if (tps->UhdmType() ==
-                       UHDM_OBJECT_TYPE::uhdmarray_typespec) {
-              array_typespec *tmp = (array_typespec *)tps;
-              if (const ref_typespec *rt = tmp->Elem_typespec()) {
-                tps = rt->Actual_typespec();
-              }
-            }
-            if (tps->UhdmType() == UHDM_OBJECT_TYPE::uhdmstruct_typespec) {
-              struct_typespec *sts = (struct_typespec *)tps;
-              // `tps` is the type of the ROOT base (select_path[0]).  Descend
-              // through the already-consumed path elements (select_path[1..
-              // level-1]) to the struct type at THIS nesting level, so a nested
-              // positional pattern (e.g. `CFG.HSK.DLY` where `HSK` is `'{1,0}`)
-              // indexes `DLY` in `hsk_t`, not in `cfg_t`.
-              for (uint32_t lvl = 1; lvl < level && sts; lvl++) {
-                struct_typespec *nextSts = nullptr;
-                if (sts->Members()) {
-                  for (typespec_member *member : *sts->Members()) {
-                    if (member->VpiName() == select_path[lvl]) {
-                      if (const ref_typespec *mrt = member->Typespec()) {
-                        const typespec *mts = mrt->Actual_typespec();
-                        if (mts && mts->UhdmType() ==
-                                       UHDM_OBJECT_TYPE::uhdmstruct_typespec)
-                          nextSts = (struct_typespec *)mts;
-                      }
+              return t;
+            };
+            for (uint32_t lvl = 1; lvl < level && cur; lvl++) {
+              const std::string &tok = select_path[lvl];
+              if (!tok.empty() && tok[0] == '[') {
+                cur = unwrapArray(cur);
+              } else {
+                const struct_typespec *st =
+                    (cur->UhdmType() == UHDM_OBJECT_TYPE::uhdmstruct_typespec)
+                        ? (const struct_typespec *)cur
+                        : nullptr;
+                const typespec *next = nullptr;
+                if (st && st->Members()) {
+                  for (typespec_member *member : *st->Members()) {
+                    if (member->VpiName() == tok) {
+                      if (const ref_typespec *mrt = member->Typespec())
+                        next = mrt->Actual_typespec();
                       break;
                     }
                   }
                 }
-                sts = nextSts;
+                cur = next;
               }
-              if (sts && sts->Members()) {
+            }
+            // Peel any array dimensions still in front of the member access.
+            while (cur &&
+                   (cur->UhdmType() ==
+                        UHDM_OBJECT_TYPE::uhdmpacked_array_typespec ||
+                    cur->UhdmType() == UHDM_OBJECT_TYPE::uhdmarray_typespec)) {
+              const typespec *nxt = unwrapArray(cur);
+              if (nxt == cur) break;
+              cur = nxt;
+            }
+            if (cur &&
+                cur->UhdmType() == UHDM_OBJECT_TYPE::uhdmstruct_typespec) {
+              struct_typespec *sts = (struct_typespec *)cur;
+              if (sts->Members()) {
                 uint32_t i = 0;
                 for (typespec_member *member : *sts->Members()) {
                   if (member->VpiName() == elemName) {
