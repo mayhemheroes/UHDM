@@ -2738,7 +2738,8 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
           }
         }
         */
-        if (any *baseP = getObject(select_path[0], inst, pexpr, muteError)) {
+        {
+          any *baseP = getObject(select_path[0], inst, pexpr, muteError);
           const typespec *tps = nullptr;
           if (parameter *p = any_cast<parameter *>(baseP)) {
             if (const ref_typespec *rt = p->Typespec()) {
@@ -2753,7 +2754,21 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
               tps = rt->Actual_typespec();
             }
           }
-
+          // A struct parameter's VALUE is a bare assignment-pattern operation
+          // that carries no typespec (only NAMED operands are tagged with their
+          // member type).  The declared struct type is on the PARAMETER
+          // declaration in the REAL design component — unreachable from the
+          // placeholder `inst` used during expression reduction.  Ask the host
+          // (Surelog) to resolve the name to its declared typespec through a
+          // dedicated functor; this side-channel does NOT feed value
+          // resolution, so instance-specific parameter values are unaffected.
+          if (tps == nullptr && getTypespecFunctor) {
+            if (any *tsobj = getTypespecFunctor(select_path[0], inst, pexpr)) {
+              if (const typespec *t = any_cast<const typespec *>(tsobj)) {
+                tps = t;
+              }
+            }
+          }
           if (tps) {
             if (tps->UhdmType() ==
                 UHDM_OBJECT_TYPE::uhdmpacked_array_typespec) {
@@ -2770,9 +2785,31 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
             }
             if (tps->UhdmType() == UHDM_OBJECT_TYPE::uhdmstruct_typespec) {
               struct_typespec *sts = (struct_typespec *)tps;
-              if (VectorOftypespec_member *members = sts->Members()) {
+              // `tps` is the type of the ROOT base (select_path[0]).  Descend
+              // through the already-consumed path elements (select_path[1..
+              // level-1]) to the struct type at THIS nesting level, so a nested
+              // positional pattern (e.g. `CFG.HSK.DLY` where `HSK` is `'{1,0}`)
+              // indexes `DLY` in `hsk_t`, not in `cfg_t`.
+              for (uint32_t lvl = 1; lvl < level && sts; lvl++) {
+                struct_typespec *nextSts = nullptr;
+                if (sts->Members()) {
+                  for (typespec_member *member : *sts->Members()) {
+                    if (member->VpiName() == select_path[lvl]) {
+                      if (const ref_typespec *mrt = member->Typespec()) {
+                        const typespec *mts = mrt->Actual_typespec();
+                        if (mts && mts->UhdmType() ==
+                                       UHDM_OBJECT_TYPE::uhdmstruct_typespec)
+                          nextSts = (struct_typespec *)mts;
+                      }
+                      break;
+                    }
+                  }
+                }
+                sts = nextSts;
+              }
+              if (sts && sts->Members()) {
                 uint32_t i = 0;
-                for (typespec_member *member : *members) {
+                for (typespec_member *member : *sts->Members()) {
                   if (member->VpiName() == elemName) {
                     bIndex = i;
                     break;
@@ -2851,10 +2888,10 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
           if (const ref_typespec *rt = tpatt->Typespec()) {
             tps = rt->Actual_typespec();
           }
-          if (tps->VpiName() == "default") {
+          if (tps && tps->VpiName() == "default") {
             defaultPattern = (any *)tpatt->Pattern();
           }
-          if (!elemName.empty() && (tps->VpiName() == elemName)) {
+          if (tps && !elemName.empty() && (tps->VpiName() == elemName)) {
             const any *patt = tpatt->Pattern();
             UHDM_OBJECT_TYPE pattType = patt->UhdmType();
             if (pattType == UHDM_OBJECT_TYPE::uhdmconstant) {
@@ -2901,6 +2938,15 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
             return hierarchicalSelector(select_path, level + 1, (expr *)operand,
                                         invalidValue, inst, pexpr,
                                         returnType);
+          }
+        } else if (operandType == UHDM_OBJECT_TYPE::uhdmoperation) {
+          // A positional operand that is itself an assignment-pattern (a nested
+          // struct value, e.g. `HSK` in `cfg_t`).  This happens when a struct
+          // parameter's value comes from a package localparam whose clone lost
+          // the tagged-pattern member names, leaving a purely positional tree.
+          if ((bIndex >= 0) && (bIndex == sInd)) {
+            return hierarchicalSelector(select_path, level + 1, operand,
+                                        invalidValue, inst, pexpr, returnType);
           }
         }
         sInd++;

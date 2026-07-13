@@ -170,6 +170,11 @@ class ExprEval {
    * context */
   void setGetObjectFunctor(GetObjectFunctor func) { getObjectFunctor = func; }
   void setGetValueFunctor(GetObjectFunctor func) { getValueFunctor = func; }
+  /* Resolves a name to its DECLARED typespec (not its value). Used to navigate
+   * struct/packed member layouts of parameters whose value is a typespec-less
+   * assignment-pattern operation. Kept separate from getValue to avoid
+   * polluting value resolution. */
+  void setGetTypespecFunctor(GetObjectFunctor func) { getTypespecFunctor = func; }
   void setGetTaskFuncFunctor(GetTaskFuncFunctor func) {
     getTaskFuncFunctor = func;
   }
@@ -182,6 +187,7 @@ class ExprEval {
  private:
   GetObjectFunctor getObjectFunctor = nullptr;
   GetObjectFunctor getValueFunctor = nullptr;
+  GetObjectFunctor getTypespecFunctor = nullptr;
   GetTaskFuncFunctor getTaskFuncFunctor = nullptr;
   const UHDM::design* m_design = nullptr;
   bool m_muteError = false;
