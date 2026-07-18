@@ -1988,6 +1988,42 @@ hier_path* hier_path::DeepClone(BaseClass* parent,
               found = true;
             }
           }
+        } else if (previous->UhdmType() == UHDM_OBJECT_TYPE::uhdmparameter) {
+          // A struct-typed PARAMETER member (`CFG.HSK`, where `CFG` is an
+          // interface parameter of a struct type): navigate into the
+          // parameter's typespec so the nested field chain resolves.  The
+          // interface_inst case above sets `previous` to the parameter object
+          // when it matches `CFG`, but left the following `.HSK.DLY` elements
+          // unresolved — an interface-port member read `sub.CFG.HSK.DLY` (an
+          // assert expression or an array index in the rp32 SoC TCB
+          // peripherals) then reported UHDM_UNRESOLVED_HIER_PATH.
+          parameter* param = (parameter*)previous;
+          const typespec* tps = nullptr;
+          if (const ref_typespec* rt = param->Typespec()) {
+            tps = rt->Actual_typespec();
+          }
+          if (tps == nullptr) break;
+          UHDM_OBJECT_TYPE ttype = tps->UhdmType();
+          if (ttype == UHDM_OBJECT_TYPE::uhdmpacked_array_typespec) {
+            packed_array_typespec* ptps = (packed_array_typespec*)tps;
+            if (const ref_typespec* rt = ptps->Elem_typespec()) {
+              tps = rt->Actual_typespec();
+              ttype = tps->UhdmType();
+            }
+          }
+          if (ttype == UHDM_OBJECT_TYPE::uhdmstruct_typespec) {
+            struct_typespec* stpt = (struct_typespec*)tps;
+            for (typespec_member* tsmember : *stpt->Members()) {
+              if (tsmember->VpiName() == name) {
+                if (ref_obj* cro = any_cast<ref_obj*>(current)) {
+                  cro->Actual_group(tsmember);
+                  previous = tsmember;
+                  found = true;
+                  break;
+                }
+              }
+            }
+          }
         } else if (previous->UhdmType() == UHDM_OBJECT_TYPE::uhdmarray_var) {
           array_var* avar = (array_var*)previous;
           if (VectorOfvariables* vars = avar->Variables()) {
