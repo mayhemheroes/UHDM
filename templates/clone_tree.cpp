@@ -1559,6 +1559,26 @@ hier_path* hier_path::DeepClone(BaseClass* parent,
                     }
                   }
                 }
+                // An interface reached only through a modport PORT exposes its
+                // resolved parameters/localparams on Param_assigns() (elaborated
+                // by NetlistElaboration::elab_interface_), not on Parameters().
+                // Bind `<port>.CFG` / `<port>.CFG_BUS_OFF` to the param on the
+                // Lhs so a terminal read gets its value and a nested struct-param
+                // chain (`sub.CFG.HSK.DLY`) continues into the uhdmparameter case
+                // below (rp32 SoC TCB lib: logsize2byteena / register_* / demux).
+                if (!found && interf->Param_assigns()) {
+                  for (param_assign* pa : *interf->Param_assigns()) {
+                    const any* lhs = pa->Lhs();
+                    if (lhs && lhs->VpiName() == name) {
+                      if (ref_obj* cro = any_cast<ref_obj*>(current)) {
+                        cro->Actual_group((any*)lhs);
+                      }
+                      previous = (any*)lhs;
+                      found = true;
+                      break;
+                    }
+                  }
+                }
                 if (!found && interf->Task_funcs()) {
                   for (auto tf : *interf->Task_funcs()) {
                     if (tf->VpiName() == name) {
