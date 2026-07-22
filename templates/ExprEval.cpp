@@ -5845,7 +5845,16 @@ expr *ExprEval::evalFunc(function *func, std::vector<any *> *args,
   if (param_assigns) {
     modinst->Param_assigns(s.MakeParam_assignVec());
     for (auto p : *param_assigns) {
-      ElaboratorContext elaboratorContext(&s, false, muteError);
+      // Scope setup only: this clone exists to populate the name->typespec
+      // map below (from p->Lhs()); the cloned Rhs is never read here.  Cloning
+      // a struct-typed param whose Rhs is a const-function call (e.g.
+      // `CVA6Cfg = build_config(cva6_cfg)`) can re-enter the function's result
+      // typespec whose members carry not-yet-evaluated struct-arg field refs
+      // (`CVA6Cfg.NrNonIdempotentRules`), which are unreachable in this
+      // detached clone.  Those are internal artifacts, not user errors, so
+      // always mute this scope-setup clone (real param errors are reported by
+      // the actual parameter elaboration).
+      ElaboratorContext elaboratorContext(&s, false, /*muteErrors=*/true);
       any *pp = clone_tree(p, &elaboratorContext);
       modinst->Param_assigns()->push_back((param_assign *)pp);
       const typespec *tps = nullptr;
