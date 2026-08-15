@@ -3776,7 +3776,18 @@ expr *ExprEval::reduceExpr(const any *result, bool &invalidValue,
                 the_val = reduceExpr(operands[2], localInvalidValue, inst,
                                      pexpr, muteError);
               }
-              if (localInvalidValue == false) {
+              // An UNBASED UNSIZED fill literal (`'1`, `'0`, `'x`, `'z` —
+              // VpiSize() == -1) must keep its fill identity: collapsing it
+              // through get_value() yields INT:1, so a context-determined
+              // `wide = cond ? … : '1` came out as the VALUE 1 instead of
+              // all-ones (CVA6 cva6_ptw `req_port_o.data_be = CVA6Cfg.
+              // IS_XLEN32 ? be_gen_32(…) : '1` → 8'h01 instead of 8'hff).
+              // Hand the literal back unchanged and let the consumer
+              // replicate it to the target width.
+              bool the_val_is_fill = false;
+              if (the_val && the_val->UhdmType() == uhdmconstant)
+                the_val_is_fill = (((constant *)the_val)->VpiSize() == -1);
+              if (localInvalidValue == false && !the_val_is_fill) {
                 val = get_value(localInvalidValue, the_val);
                 if (localInvalidValue == false) {
                   constant *c = s.MakeConstant();
