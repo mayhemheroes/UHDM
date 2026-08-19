@@ -2348,7 +2348,18 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
               } else if (returnType == ReturnType::MEMBER) {
                 return member;
               } else {
-                return member->Actual_value() ? member->Actual_value() : member->Default_value();
+                any *res = member->Actual_value() ? member->Actual_value()
+                                                  : member->Default_value();
+                // A member that is itself a struct must keep walking the
+                // remaining path elements (`CFG.u.sidWidth`): returning the
+                // intermediate member's value here drops the trailing
+                // selectors, and the caller then substitutes a whole-struct
+                // value where a scalar field was expected.  The
+                // struct_typespec branch below already does this.
+                if (lastElem || res == nullptr) return res;
+                return hierarchicalSelector(select_path, level + 1, res,
+                                            invalidValue, inst, pexpr,
+                                            returnType, muteError);
               }
             }
           }
@@ -2446,7 +2457,13 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
                     }
                   }
                 } else {
-                  return member->Actual_value() ? member->Actual_value() : member->Default_value();
+                  any *res = member->Actual_value() ? member->Actual_value()
+                                                    : member->Default_value();
+                  // Same nested-member walk as the struct_var branch above.
+                  if (lastElem || res == nullptr) return res;
+                  return hierarchicalSelector(select_path, level + 1, res,
+                                              invalidValue, inst, pexpr,
+                                              returnType, muteError);
                 }
               }
             }
@@ -2555,7 +2572,13 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
                   }
                 }
               } else {
-                return member->Actual_value() ? member->Actual_value() : member->Default_value();
+                any *res = member->Actual_value() ? member->Actual_value()
+                                                  : member->Default_value();
+                // Same nested-member walk as the struct_var branch above.
+                if (lastElem || res == nullptr) return res;
+                return hierarchicalSelector(select_path, level + 1, res,
+                                            invalidValue, inst, pexpr,
+                                            returnType, muteError);
               }
             }
           }
