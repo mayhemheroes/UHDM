@@ -34,6 +34,7 @@
 #include <bitset>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <locale>
 #include <regex>
@@ -2326,6 +2327,82 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
   }
   std::string elemName = select_path[level];
   bool lastElem = (level == select_path.size() - 1);
+  if (constant *cobj = any_cast<constant *>(object)) {
+    // Member-name selection into a PACKED struct constant (a config value
+    // assembled from a struct-returning function reduces to a constant that
+    // carries the struct typespec): slice the member's bits — first declared
+    // member occupies the MSBs.  Without this, a walk that lands on such a
+    // constant returned null and the width evaluation of
+    // `[HPDcacheCfg.u.memAddrWidth-1:0]` collapsed to 1.
+    const struct_typespec *stps = nullptr;
+    if (const ref_typespec *rt = cobj->Typespec())
+      stps = rt->Actual_typespec<struct_typespec>();
+    if (stps && stps->Members() && !elemName.empty() && elemName[0] != '[') {
+      uint64_t total = 0, off = 0, mw = 0;
+      const typespec *mts_found = nullptr;
+      bool found = false, bad = false;
+      for (typespec_member *member : *stps->Members()) {
+        const typespec *mts = member->Typespec()
+                                  ? member->Typespec()->Actual_typespec()
+                                  : nullptr;
+        bool iv = false;
+        uint64_t w = size(mts, iv, inst, pexpr, true, true);
+        if (iv || w == 0) {
+          bad = true;
+          break;
+        }
+        if (!found && member->VpiName() == elemName) {
+          found = true;
+          mw = w;
+          mts_found = mts;
+        } else if (!found) {
+          off += w;
+        }
+        total += w;
+      }
+      if (found && !bad) {
+        std::string bin = toBinary(cobj);
+        if (bin.size() < total)
+          bin.insert(bin.begin(), total - bin.size(), '0');
+        else if (bin.size() > total)
+          bin = bin.substr(bin.size() - total);
+        std::string mbits = bin.substr(off, mw);
+        // Only a FULLY-DEFINED slice is a usable value.  A parameter stamped
+        // with a partially-evaluated struct (x-laden merge from a failed
+        // member write) must NOT satisfy the member select — returning the
+        // garbage made `CFG.u.sidWidth` fold to a 96-bit x-mix and every
+        // dependent port width collapsed (param_nested_struct_field_width).
+        for (char bch : mbits)
+          if (bch != '0' && bch != '1') {
+            found = false;
+            break;
+          }
+        if (mbits.empty()) found = false;
+      }
+      if (found && !bad) {
+        std::string bin = toBinary(cobj);
+        if (bin.size() < total)
+          bin.insert(bin.begin(), total - bin.size(), '0');
+        else if (bin.size() > total)
+          bin = bin.substr(bin.size() - total);
+        std::string mbits = bin.substr(off, mw);
+        constant *c = s.MakeConstant();
+        c->VpiValue("BIN:" + mbits);
+        c->VpiDecompile(mbits);
+        c->VpiSize(static_cast<int32_t>(mbits.size()));
+        c->VpiConstType(vpiBinaryConst);
+        if (mts_found) {
+          ref_typespec *rtc = s.MakeRef_typespec();
+          rtc->Actual_typespec(const_cast<typespec *>(mts_found));
+          rtc->VpiParent(c);
+          c->Typespec(rtc);
+        }
+        if (lastElem) return c;
+        return hierarchicalSelector(select_path, level + 1, c, invalidValue,
+                                    inst, pexpr, returnType, muteError);
+      }
+    }
+  }
   if (variables *var = any_cast<variables *>(object)) {
     UHDM_OBJECT_TYPE ttps = var->UhdmType();
     if (ttps == UHDM_OBJECT_TYPE::uhdmstruct_var) {
@@ -4755,6 +4832,75 @@ expr *ExprEval::reduceExpr(const any *result, bool &invalidValue,
   } else if (objtype == UHDM_OBJECT_TYPE::uhdmhier_path) {
     hier_path *path = (hier_path *)result;
     return (expr *)decodeHierPath(path, invalidValue, inst, pexpr, ReturnType::VALUE);
+  } else if (objtype == UHDM_OBJECT_TYPE::uhdmstruct_var) {
+    // A struct value computed by a constant function keeps its member values
+    // as typespec_member Actual_value annotations (evalStmt's hier_path LHS
+    // branch writes them member by member).  Assemble the packed constant
+    // from those annotations so the struct_var reduces like any other
+    // constant.  Without this, a parameter override whose actual is such a
+    // value (`child #(.Cfg(Cfg))` with Cfg built by a struct-returning
+    // function chain) never gets a usable value: the instance parameter is
+    // stamped 0 and every member fold of it reads 0 — CVA6's
+    // hpdcache_ctrl_pe read HPDcacheCfg.u.lowLatency as 0 that way.
+    const struct_var *sv = (const struct_var *)result;
+    std::function<bool(const struct_typespec *, std::string &)> assemble =
+        [&](const struct_typespec *stps, std::string &bits) -> bool {
+      if (!stps || !stps->Members()) return false;
+      for (typespec_member *member : *stps->Members()) {
+        const typespec *mts = member->Typespec()
+                                  ? member->Typespec()->Actual_typespec()
+                                  : nullptr;
+        bool tmpInvalid = false;
+        uint64_t mw = size(mts, tmpInvalid, inst, pexpr, true, muteError);
+        if (tmpInvalid || mw == 0 || mw > 64) return false;
+        const any *mv = member->Actual_value();
+        if (!mv) mv = member->Default_value();
+        if (!mv) return false;
+        if (mv->UhdmType() == UHDM_OBJECT_TYPE::uhdmstruct_var) {
+          const struct_typespec *nstps = nullptr;
+          if (const ref_typespec *nrt = ((const struct_var *)mv)->Typespec())
+            nstps = nrt->Actual_typespec<struct_typespec>();
+          if (!nstps && mts &&
+              mts->UhdmType() == UHDM_OBJECT_TYPE::uhdmstruct_typespec)
+            nstps = (const struct_typespec *)mts;
+          std::string sub;
+          if (!assemble(nstps, sub)) return false;
+          if (sub.size() > mw)
+            sub = sub.substr(sub.size() - mw);
+          else
+            while (sub.size() < mw) sub.insert(sub.begin(), '0');
+          bits += sub;
+        } else {
+          bool iv = false;
+          expr *rme =
+              reduceExpr((any *)mv, iv, inst, pexpr, muteError);
+          if (iv || !rme ||
+              rme->UhdmType() != UHDM_OBJECT_TYPE::uhdmconstant)
+            return false;
+          uint64_t v = get_uvalue(iv, rme);
+          if (iv) return false;
+          bits += NumUtils::toBinary(static_cast<int32_t>(mw), v);
+        }
+      }
+      return true;
+    };
+    const struct_typespec *stps = nullptr;
+    if (const ref_typespec *rt = sv->Typespec())
+      stps = rt->Actual_typespec<struct_typespec>();
+    std::string bits;
+    if (assemble(stps, bits) && !bits.empty()) {
+      constant *c = s.MakeConstant();
+      c->VpiValue("BIN:" + bits);
+      c->VpiDecompile(bits);
+      c->VpiSize(static_cast<int32_t>(bits.size()));
+      c->VpiConstType(vpiBinaryConst);
+      ref_typespec *rtc = s.MakeRef_typespec();
+      rtc->Actual_typespec(const_cast<struct_typespec *>(stps));
+      rtc->VpiParent(c);
+      c->Typespec(rtc);
+      return c;
+    }
+    return (expr *)result;
   } else if (objtype == UHDM_OBJECT_TYPE::uhdmbit_select) {
     bit_select *sel = (bit_select *)result;
     const std::string_view name = sel->VpiName();
