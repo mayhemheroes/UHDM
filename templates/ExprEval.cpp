@@ -4852,10 +4852,29 @@ expr *ExprEval::reduceExpr(const any *result, bool &invalidValue,
                                   : nullptr;
         bool tmpInvalid = false;
         uint64_t mw = size(mts, tmpInvalid, inst, pexpr, true, muteError);
-        if (tmpInvalid || mw == 0 || mw > 64) return false;
+        if ((tmpInvalid || mw == 0) && mts &&
+            mts->UhdmType() == UHDM_OBJECT_TYPE::uhdmenum_typespec) {
+          // An ENUM member's size can come back 0 here; its packed width is
+          // the base typespec's (default int = 32 when unspecified).
+          const enum_typespec *ets = (const enum_typespec *)mts;
+          tmpInvalid = false;
+          mw = 0;
+          if (ets->Base_typespec() && ets->Base_typespec()->Actual_typespec())
+            mw = size(ets->Base_typespec()->Actual_typespec(), tmpInvalid,
+                      inst, pexpr, true, muteError);
+          if (tmpInvalid || mw == 0) {
+            tmpInvalid = false;
+            mw = 32;
+          }
+        }
+        if (tmpInvalid || mw == 0) {
+          return false;
+        }
         const any *mv = member->Actual_value();
         if (!mv) mv = member->Default_value();
-        if (!mv) return false;
+        if (!mv) {
+          return false;
+        }
         if (mv->UhdmType() == UHDM_OBJECT_TYPE::uhdmstruct_var) {
           const struct_typespec *nstps = nullptr;
           if (const ref_typespec *nrt = ((const struct_var *)mv)->Typespec())
@@ -4874,12 +4893,99 @@ expr *ExprEval::reduceExpr(const any *result, bool &invalidValue,
           bool iv = false;
           expr *rme =
               reduceExpr((any *)mv, iv, inst, pexpr, muteError);
-          if (iv || !rme ||
-              rme->UhdmType() != UHDM_OBJECT_TYPE::uhdmconstant)
-            return false;
-          uint64_t v = get_uvalue(iv, rme);
-          if (iv) return false;
-          bits += NumUtils::toBinary(static_cast<int32_t>(mw), v);
+          std::string b;
+          if (!iv && rme &&
+              rme->UhdmType() == UHDM_OBJECT_TYPE::uhdmconstant) {
+            // Convert through the binary string, not a 64-bit integer —
+            // config structs carry members far wider than 64 bits (CVA6's
+            // region address/length arrays).
+            b = toBinary((constant *)rme);
+          } else {
+            // A packed-array member value kept as an ASSIGNMENT PATTERN or
+            // CONCAT of constants (`NonIdempotentAddrBase = '{...}`):
+            // reduce each element and concatenate, first element = MSBs.
+            const operation *op = any_cast<const operation *>(mv);
+            if (!op && rme) op = any_cast<const operation *>(rme);
+            int32_t optype = op ? op->VpiOpType() : 0;
+            if (op && op->Operands() && op->Operands()->size() == 1 &&
+                (optype == vpiMultiAssignmentPatternOp ||
+                 optype == vpiAssignmentPatternOp || optype == vpiCastOp)) {
+              // A CAST or pattern already folded to ONE constant narrower
+              // than the member (CVA6's NonIdempotentAddrBase carries a
+              // 128-bit cast constant for a [15:0][63:0] field): SV
+              // assignment widening zero-extends — the generic left-pad
+              // below applies it.
+              bool eiv = false;
+              expr *re = reduceExpr((*op->Operands())[0], eiv, inst, pexpr,
+                                    muteError);
+              if (eiv || !re ||
+                  re->UhdmType() != UHDM_OBJECT_TYPE::uhdmconstant) {
+                return false;
+              }
+              b = toBinary((constant *)re);
+            } else if (op && op->Operands() && op->Operands()->size() == 2 &&
+                (optype == vpiMultiAssignmentPatternOp ||
+                 optype == vpiMultiConcatOp)) {
+              // Replication (`'{N{value}}` / `{N{value}}`): repeat the
+              // element's bits N times.
+              bool civ = false;
+              int64_t cnt = get_value(
+                  civ, reduceExpr((*op->Operands())[0], civ, inst, pexpr,
+                                  muteError));
+              bool eiv = false;
+              expr *re = reduceExpr((*op->Operands())[1], eiv, inst, pexpr,
+                                    muteError);
+              if (civ || eiv || cnt <= 0 || !re ||
+                  re->UhdmType() != UHDM_OBJECT_TYPE::uhdmconstant ||
+                  (mw % (uint64_t)cnt) != 0) {
+                return false;
+              }
+              uint64_t ew = mw / (uint64_t)cnt;
+              std::string eb = toBinary((constant *)re);
+              if (eb.size() > ew)
+                eb = eb.substr(eb.size() - ew);
+              else
+                while (eb.size() < ew) eb.insert(eb.begin(), '0');
+              for (int64_t r = 0; r < cnt; r++) b += eb;
+            } else if (op && op->Operands() && !op->Operands()->empty() &&
+                (optype == vpiAssignmentPatternOp || optype == vpiConcatOp)) {
+              size_t n = op->Operands()->size();
+              if (mw % n) {
+                return false;
+              }
+              uint64_t ew = mw / n;
+              bool ok = true;
+              for (auto operand : *op->Operands()) {
+                bool eiv = false;
+                expr *re = reduceExpr(operand, eiv, inst, pexpr, muteError);
+                if (eiv || !re ||
+                    re->UhdmType() != UHDM_OBJECT_TYPE::uhdmconstant) {
+                  ok = false;
+                  break;
+                }
+                std::string eb = toBinary((constant *)re);
+                if (eb.size() > ew)
+                  eb = eb.substr(eb.size() - ew);
+                else
+                  while (eb.size() < ew) eb.insert(eb.begin(), '0');
+                b += eb;
+              }
+              if (!ok) {
+                return false;
+              }
+            } else {
+              return false;
+            }
+          }
+          if (b.size() > mw)
+            b = b.substr(b.size() - mw);
+          else
+            while (b.size() < mw) b.insert(b.begin(), '0');
+          for (char bch : b)
+            if (bch != '0' && bch != '1') {
+              return false;
+            }
+          bits += b;
         }
       }
       return true;
