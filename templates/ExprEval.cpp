@@ -2225,6 +2225,67 @@ task_func *ExprEval::getTaskFunc(std::string_view name, const any *inst) {
   return nullptr;
 }
 
+
+// Element select `[N]` on a PACKED-ARRAY-typed constant: slice the whole
+// element, not bit N.  The constant's VpiSize can be misrecorded (a pattern
+// reduce can size operands by a wrong context), so the geometry trusts the
+// raw BIN value string; ascending ranges put element `low` at the MSBs.
+// Returns nullptr when the shape does not apply (caller falls back to a
+// plain bit select).
+static constant *reducePackedElemSelect(constant *c, int64_t selectIndex,
+                                        ExprEval *ev, Serializer &s,
+                                        bool &invalidValue, const any *inst,
+                                        const any *pexpr, bool muteError) {
+  const typespec *cts =
+      c->Typespec() ? c->Typespec()->Actual_typespec() : nullptr;
+  const typespec *ets = nullptr;
+  VectorOfrange *rgs = nullptr;
+  if (cts) {
+    if (const packed_array_typespec *pt =
+            any_cast<const packed_array_typespec *>(cts)) {
+      if (pt->Elem_typespec()) ets = pt->Elem_typespec()->Actual_typespec();
+      rgs = pt->Ranges();
+    } else if (const logic_typespec *lt =
+                   any_cast<const logic_typespec *>(cts)) {
+      if (lt->Elem_typespec()) {
+        ets = lt->Elem_typespec()->Actual_typespec();
+        rgs = lt->Ranges();
+      }
+    }
+  }
+  if (!ets || !rgs || rgs->empty()) return nullptr;
+  std::string_view v = c->VpiValue();
+  if (v.rfind("BIN:", 0) != 0) return nullptr;
+  std::string bits(v.substr(4));
+  bool iv2 = false;
+  int64_t l = ev->get_value(
+      iv2, ev->reduceExpr(rgs->at(0)->Left_expr(), iv2, inst, pexpr, muteError));
+  int64_t r = ev->get_value(
+      iv2, ev->reduceExpr(rgs->at(0)->Right_expr(), iv2, inst, pexpr, muteError));
+  if (iv2) return nullptr;
+  int64_t lo = std::min(l, r);
+  uint64_t n = (uint64_t)(std::abs(l - r) + 1);
+  if (n < 1 || bits.size() % n != 0) return nullptr;
+  uint64_t ew = bits.size() / n;
+  if (ew < 2) return nullptr;
+  if (selectIndex < lo || (uint64_t)(selectIndex - lo) >= n) return nullptr;
+  uint64_t pos = (l < r) ? (uint64_t)(selectIndex - lo)
+                         : (n - 1 - (uint64_t)(selectIndex - lo));
+  std::string ebits = bits.substr(pos * ew, ew);
+  for (char bch : ebits)
+    if (bch != '0' && bch != '1') return nullptr;
+  constant *ec = s.MakeConstant();
+  ec->VpiValue("BIN:" + ebits);
+  ec->VpiDecompile(ebits);
+  ec->VpiSize(static_cast<int32_t>(ebits.size()));
+  ec->VpiConstType(vpiBinaryConst);
+  ref_typespec *ert = s.MakeRef_typespec();
+  ert->Actual_typespec(const_cast<typespec *>(ets));
+  ert->VpiParent(ec);
+  ec->Typespec(ert);
+  return ec;
+}
+
 any *ExprEval::decodeHierPath(hier_path *path, bool &invalidValue,
                               const any *inst, const any *pexpr,
                               ReturnType returnType, bool muteError) {
@@ -2793,6 +2854,24 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
         return (typespec *)rt->Actual_typespec();
       }
     } else if (constant *c = any_cast<constant *>(object)) {
+      // ELEMENT select on a packed-array-typed constant: `[N]` must slice
+      // the whole element, not bit N (fpnew_top's
+      // `Implementation.UnitTypes[opgrp]` was stamped with single bits
+      // tracking the genvar, poisoning paramod uniquification, constant
+      // folding and generate elaboration downstream).
+      if (constant *ec = reducePackedElemSelect(c, selectIndex, this, s,
+                                                invalidValue, inst, pexpr,
+                                                muteError)) {
+        if (lastElem) {
+          if (returnType == ReturnType::TYPESPEC) {
+            if (ref_typespec *rt = ec->Typespec()) return rt->Actual_typespec();
+            return nullptr;
+          }
+          return ec;
+        }
+        return hierarchicalSelector(select_path, level + 1, ec, invalidValue,
+                                    inst, pexpr, returnType, muteError);
+      }
       if (expr *tmp = reduceBitSelect(c, selectIndex, invalidValue, inst, pexpr,
                                       muteError)) {
         if (returnType == ReturnType::TYPESPEC) {
@@ -2819,6 +2898,7 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
       int32_t sInd = 0;
 
       int32_t bIndex = -1;
+      const typespec *bMemberTs = nullptr;
       if (inst) {
         /*
         any *baseP = nullptr;
@@ -2932,6 +3012,8 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
                 for (typespec_member *member : *sts->Members()) {
                   if (member->VpiName() == elemName) {
                     bIndex = i;
+                    if (const ref_typespec *mrt = member->Typespec())
+                      bMemberTs = mrt->Actual_typespec();
                     break;
                   }
                   i++;
@@ -3055,6 +3137,19 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
           }
         } else if (operandType == UHDM_OBJECT_TYPE::uhdmconstant) {
           if ((bIndex >= 0) && (bIndex == sInd)) {
+            // Attach the member's TRUE typespec to the positional constant:
+            // pre-folded pattern operands carry none (and can carry a
+            // mis-recorded size), so a following `[N]` bit-selected instead
+            // of element-selecting.
+            if (bMemberTs) {
+              constant *oc = (constant *)operand;
+              if (oc->Typespec() == nullptr) {
+                ref_typespec *ort = s.MakeRef_typespec();
+                ort->Actual_typespec((typespec *)bMemberTs);
+                ort->VpiParent(oc);
+                oc->Typespec(ort);
+              }
+            }
             return hierarchicalSelector(select_path, level + 1, (expr *)operand,
                                         invalidValue, inst, pexpr,
                                         returnType);
@@ -5142,9 +5237,17 @@ expr *ExprEval::reduceExpr(const any *result, bool &invalidValue,
                                      invalidValue, inst, pexpr);
           }
         } else if (otype == UHDM_OBJECT_TYPE::uhdmconstant) {
-          result = reduceBitSelect((constant *)object,
-                                   static_cast<uint32_t>(index_val),
-                                   invalidValue, inst, pexpr);
+          // Element select on a packed-array-typed constant first (see
+          // reducePackedElemSelect) — bit select only for scalar vectors.
+          if (constant *ec = reducePackedElemSelect(
+                  (constant *)object, (int64_t)index_val, this, s,
+                  invalidValue, inst, pexpr, muteError)) {
+            result = ec;
+          } else {
+            result = reduceBitSelect((constant *)object,
+                                     static_cast<uint32_t>(index_val),
+                                     invalidValue, inst, pexpr);
+          }
         }
       }
     }
