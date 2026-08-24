@@ -37,6 +37,7 @@
 #include <functional>
 #include <iostream>
 #include <locale>
+#include <map>
 #include <regex>
 #include <sstream>
 #include <string_view>
@@ -305,6 +306,25 @@ any *ExprEval::getValue(std::string_view name, const any *inst,
       for (auto p : *param_assigns) {
         if (p->Lhs() && (p->Lhs()->VpiName() == the_name)) {
           result = (any *)p->Rhs();
+          // A >64-bit parameter resolves via its complex-value pattern
+          // operation, which carries no typespec of its own; propagate the
+          // declaring parameter's typespec so downstream member/element
+          // selection knows the struct geometry.
+          if (result && (result->UhdmType() == UHDM_OBJECT_TYPE::uhdmoperation)) {
+            operation *rop = (operation *)result;
+            if (rop->Typespec() == nullptr) {
+              if (const parameter *lp =
+                      any_cast<const parameter *>(p->Lhs())) {
+                if (lp->Typespec() && lp->Typespec()->Actual_typespec()) {
+                  ref_typespec *rt = s.MakeRef_typespec();
+                  rt->Actual_typespec(
+                      (typespec *)lp->Typespec()->Actual_typespec());
+                  rt->VpiParent(rop);
+                  rop->Typespec(rt);
+                }
+              }
+            }
+          }
           break;
         }
       }
@@ -2226,6 +2246,278 @@ task_func *ExprEval::getTaskFunc(std::string_view name, const any *inst) {
 }
 
 
+// Fold an assignment-pattern (or concat) VALUE against its declared
+// typespec into a flat binary string, member/element-wise.  Handles nested
+// patterns, `'{default: v}` replication, tagged and positional operands,
+// packed arrays, structs, and enum leaves.  This is what makes a >64-bit
+// struct parameter's pattern value (unreachable by the legacy 64-bit Value
+// engine) selectable: fpnew's `Implementation.UnitTypes[opgrp]` ends on a
+// `'{default: PARALLEL}` operation that must reduce to a constant for the
+// generate-if conditions downstream to evaluate.
+static bool foldPatternBits(const any *val, const typespec *ts, ExprEval *ev,
+                            Serializer &s, const any *inst, const any *pexpr,
+                            bool muteError, std::string &bits, int depth = 0) {
+  if (!val || !ts || depth > 16) return false;
+  if (val->UhdmType() == UHDM_OBJECT_TYPE::uhdmtagged_pattern)
+    return foldPatternBits(((const tagged_pattern *)val)->Pattern(), ts, ev, s,
+                           inst, pexpr, muteError, bits, depth + 1);
+  bool inv = false;
+  uint64_t w = ev->size(ts, inv, inst, pexpr, true, muteError);
+  if (inv || w == 0) {
+    if (ts->UhdmType() == UHDM_OBJECT_TYPE::uhdmenum_typespec) {
+      const enum_typespec *ets = (const enum_typespec *)ts;
+      inv = false;
+      w = 0;
+      if (ets->Base_typespec() && ets->Base_typespec()->Actual_typespec())
+        w = ev->size(ets->Base_typespec()->Actual_typespec(), inv, inst, pexpr,
+                     true, muteError);
+      if (inv || w == 0) w = 32;
+    } else {
+      return false;
+    }
+  }
+  if (val->UhdmType() == UHDM_OBJECT_TYPE::uhdmoperation) {
+    const operation *op = (const operation *)val;
+    int32_t ot = op->VpiOpType();
+    if (ot == vpiAssignmentPatternOp || ot == vpiConcatOp) {
+      VectorOfany *ops = op->Operands();
+      if (!ops || ops->empty()) return false;
+      auto rangeCount = [&](VectorOfrange *rs) -> uint64_t {
+        if (!rs || rs->empty()) return 0;
+        bool iv = false;
+        int64_t l = ev->get_value(
+            iv, ev->reduceExpr((any *)rs->at(0)->Left_expr(), iv, inst, pexpr,
+                               muteError));
+        int64_t r = ev->get_value(
+            iv, ev->reduceExpr((any *)rs->at(0)->Right_expr(), iv, inst,
+                               pexpr, muteError));
+        if (iv) return 0;
+        return (uint64_t)(l > r ? l - r + 1 : r - l + 1);
+      };
+      const typespec *elemTs = nullptr;
+      uint64_t n = 0;
+      UHDM_OBJECT_TYPE tt = ts->UhdmType();
+      if (tt == UHDM_OBJECT_TYPE::uhdmpacked_array_typespec) {
+        auto *t = (const packed_array_typespec *)ts;
+        n = rangeCount(t->Ranges());
+        if (t->Elem_typespec()) elemTs = t->Elem_typespec()->Actual_typespec();
+      } else if (tt == UHDM_OBJECT_TYPE::uhdmarray_typespec) {
+        auto *t = (const array_typespec *)ts;
+        n = rangeCount(t->Ranges());
+        if (t->Elem_typespec()) elemTs = t->Elem_typespec()->Actual_typespec();
+      } else if (tt == UHDM_OBJECT_TYPE::uhdmlogic_typespec) {
+        auto *t = (const logic_typespec *)ts;
+        if (t->Elem_typespec()) {
+          n = rangeCount(t->Ranges());
+          elemTs = t->Elem_typespec()->Actual_typespec();
+          // Typedef-alias duplication: the Elem chain repeats the outer
+          // range — descend one more level and correct the total width.
+          if (elemTs) {
+            if (const logic_typespec *elt2 =
+                    any_cast<const logic_typespec *>(elemTs)) {
+              if (elt2->Elem_typespec() &&
+                  elt2->Elem_typespec()->Actual_typespec() &&
+                  elt2->Ranges() && !elt2->Ranges()->empty()) {
+                elemTs = elt2->Elem_typespec()->Actual_typespec();
+                bool wiv2 = false;
+                uint64_t ew3 =
+                    ev->size(elemTs, wiv2, inst, pexpr, true, muteError);
+                if (!wiv2 && ew3 > 0 && n > 0) w = n * ew3;
+              }
+            }
+          }
+        } else if (t->Ranges() && !t->Ranges()->empty()) {
+          // Multi-range packed logic (`logic [0:4][31:0]`): elements are
+          // the inner dimensions; single-range: 1-bit elements.
+          n = rangeCount(t->Ranges());
+          logic_typespec *sub = s.MakeLogic_typespec();
+          if (t->Ranges()->size() >= 2) {
+            VectorOfrange *tr = s.MakeRangeVec();
+            for (uint32_t ri = 1; ri < t->Ranges()->size(); ri++)
+              tr->push_back(t->Ranges()->at(ri));
+            sub->Ranges(tr);
+          }
+          elemTs = sub;
+        }
+      } else if (tt == UHDM_OBJECT_TYPE::uhdmstruct_typespec) {
+        const struct_typespec *st = (const struct_typespec *)ts;
+        if (!st->Members()) return false;
+        // index operands: tagged by member name, positional otherwise
+        const any *defVal = nullptr;
+        std::map<std::string_view, const any *> tagged;
+        std::vector<const any *> positional;
+        for (auto o : *ops) {
+          if (o->UhdmType() == UHDM_OBJECT_TYPE::uhdmtagged_pattern) {
+            const tagged_pattern *tp = (const tagged_pattern *)o;
+            const typespec *tts =
+                tp->Typespec() ? tp->Typespec()->Actual_typespec() : nullptr;
+            if (tts && tts->VpiName() == "default")
+              defVal = tp->Pattern();
+            else if (tts)
+              tagged[tts->VpiName()] = tp->Pattern();
+            else
+              return false;
+          } else {
+            positional.push_back(o);
+          }
+        }
+        size_t pi = 0;
+        for (typespec_member *m : *st->Members()) {
+          const typespec *mts =
+              m->Typespec() ? m->Typespec()->Actual_typespec() : nullptr;
+          const any *mv = nullptr;
+          auto it = tagged.find(m->VpiName());
+          if (it != tagged.end())
+            mv = it->second;
+          else if (tagged.empty() && pi < positional.size())
+            mv = positional[pi++];
+          else if (defVal)
+            mv = defVal;
+          if (!mv || !mts) return false;
+          std::string mb;
+          if (!foldPatternBits(mv, mts, ev, s, inst, pexpr, muteError, mb,
+                               depth + 1))
+            return false;
+          bool miv = false;
+          uint64_t mw = ev->size(mts, miv, inst, pexpr, true, muteError);
+          if (miv || mw == 0) mw = mb.size();
+          if (mb.size() > mw)
+            mb = mb.substr(mb.size() - mw);
+          else
+            while (mb.size() < mw) mb.insert(mb.begin(), '0');
+          bits += mb;
+        }
+        return true;
+      }
+      if (elemTs && n > 0 && (w % n) == 0) {
+        uint64_t ew = w / n;
+        auto foldElem = [&](const any *ev0, std::string &out) -> bool {
+          std::string eb;
+          if (!foldPatternBits(ev0, elemTs, ev, s, inst, pexpr, muteError, eb,
+                               depth + 1))
+            return false;
+          if (eb.size() > ew)
+            eb = eb.substr(eb.size() - ew);
+          else
+            while (eb.size() < ew) eb.insert(eb.begin(), '0');
+          out += eb;
+          return true;
+        };
+        // `'{default: v}` — replicate the default into every element
+        if (ops->size() == 1 &&
+            ops->at(0)->UhdmType() == UHDM_OBJECT_TYPE::uhdmtagged_pattern) {
+          const tagged_pattern *tp = (const tagged_pattern *)ops->at(0);
+          const typespec *tts =
+              tp->Typespec() ? tp->Typespec()->Actual_typespec() : nullptr;
+          if (tts && tts->VpiName() == "default") {
+            std::string eb;
+            if (!foldElem(tp->Pattern(), eb)) return false;
+            for (uint64_t i = 0; i < n; i++) bits += eb;
+            return true;
+          }
+        }
+        if (ops->size() == n) {
+          for (auto o : *ops)
+            if (!foldElem(o, bits)) return false;
+          return true;
+        }
+      }
+      // Last chance: derive geometry from the VALUE — nops positional
+      // elements of w/nops bits each (guards against a mistrusted or
+      // missing element typespec).
+      if (!ops->empty() && (w % ops->size()) == 0) {
+        uint64_t ew2 = w / ops->size();
+        logic_typespec *sub2 = s.MakeLogic_typespec();
+        VectorOfrange *sr2 = s.MakeRangeVec();
+        range *rg2 = s.MakeRange();
+        constant *cl2 = s.MakeConstant();
+        cl2->VpiValue("INT:" + std::to_string((int64_t)ew2 - 1));
+        cl2->VpiSize(64);
+        cl2->VpiConstType(vpiIntConst);
+        constant *cr2 = s.MakeConstant();
+        cr2->VpiValue("INT:0");
+        cr2->VpiSize(64);
+        cr2->VpiConstType(vpiIntConst);
+        rg2->Left_expr(cl2);
+        rg2->Right_expr(cr2);
+        sr2->push_back(rg2);
+        sub2->Ranges(sr2);
+        bool allTagged = false;
+        for (auto o : *ops)
+          if (o->UhdmType() == UHDM_OBJECT_TYPE::uhdmtagged_pattern)
+            allTagged = true;
+        if (!allTagged) {
+          std::string acc;
+          bool ok2 = true;
+          for (auto o : *ops) {
+            std::string eb;
+            if (!foldPatternBits(o, sub2, ev, s, inst, pexpr, muteError, eb,
+                                 depth + 1)) {
+              ok2 = false;
+              break;
+            }
+            if (eb.size() > ew2)
+              eb = eb.substr(eb.size() - ew2);
+            else
+              while (eb.size() < ew2) eb.insert(eb.begin(), '0');
+            acc += eb;
+          }
+          if (ok2) {
+            bits += acc;
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+  }
+  // Leaf: reduce to a constant and use its bits.
+  bool liv = false;
+  expr *re = ev->reduceExpr((any *)val, liv, inst, pexpr, muteError);
+  if (liv || !re || re->UhdmType() != UHDM_OBJECT_TYPE::uhdmconstant)
+    return false;
+  constant *rc = (constant *)re;
+  std::string b;
+  if (rc->VpiSize() == -1) {
+    // fill literal '0 / '1
+    bool fiv = false;
+    uint64_t fv = ev->get_uvalue(fiv, rc);
+    if (fiv) return false;
+    b = std::string(w, fv ? '1' : '0');
+  } else {
+    b = ev->toBinary(rc);
+  }
+  if (b.size() > w)
+    b = b.substr(b.size() - w);
+  else
+    while (b.size() < w) b.insert(b.begin(), '0');
+  for (char bc : b)
+    if (bc != '0' && bc != '1') return false;
+  bits += b;
+  return true;
+}
+
+// Wrap foldPatternBits into a BIN constant carrying the typespec.
+static constant *foldPatternToConstant(const any *val, const typespec *ts,
+                                       ExprEval *ev, Serializer &s,
+                                       const any *inst, const any *pexpr,
+                                       bool muteError) {
+  std::string bits;
+  if (!foldPatternBits(val, ts, ev, s, inst, pexpr, muteError, bits) ||
+      bits.empty())
+    return nullptr;
+  constant *c = s.MakeConstant();
+  c->VpiValue("BIN:" + bits);
+  c->VpiDecompile(bits);
+  c->VpiSize(static_cast<int32_t>(bits.size()));
+  c->VpiConstType(vpiBinaryConst);
+  ref_typespec *rt = s.MakeRef_typespec();
+  rt->Actual_typespec((typespec *)ts);
+  rt->VpiParent(c);
+  c->Typespec(rt);
+  return c;
+}
+
 // Element select `[N]` on a PACKED-ARRAY-typed constant: slice the whole
 // element, not bit N.  The constant's VpiSize can be misrecorded (a pattern
 // reduce can size operands by a wrong context), so the geometry trusts the
@@ -2235,9 +2527,11 @@ task_func *ExprEval::getTaskFunc(std::string_view name, const any *inst) {
 static constant *reducePackedElemSelect(constant *c, int64_t selectIndex,
                                         ExprEval *ev, Serializer &s,
                                         bool &invalidValue, const any *inst,
-                                        const any *pexpr, bool muteError) {
+                                        const any *pexpr, bool muteError,
+                                        const typespec *cts_fallback = nullptr) {
   const typespec *cts =
       c->Typespec() ? c->Typespec()->Actual_typespec() : nullptr;
+  if (!cts) cts = cts_fallback;
   const typespec *ets = nullptr;
   VectorOfrange *rgs = nullptr;
   if (cts) {
@@ -2298,7 +2592,27 @@ any *ExprEval::decodeHierPath(hier_path *path, bool &invalidValue,
   any *object = getObject(baseObject, inst, pexpr, muteError);
   if (object) {
     if (param_assign *passign = any_cast<param_assign *>(object)) {
+      const any *passign_lhs = passign->Lhs();
       object = passign->Rhs();
+      // Propagate the parameter's typespec to a bare pattern operation: the
+      // member walk needs the struct type to attach member typespecs, and
+      // without them a trailing `[N]` bit-selects instead of
+      // element-selecting (fpnew's Implementation.UnitTypes[opgrp] when the
+      // struct is >64 bits and resolves via the complex-value pattern).
+      if (object && passign_lhs) {
+        if (operation *op0 = any_cast<operation *>(object)) {
+          if (op0->Typespec() == nullptr) {
+            const parameter *lp = any_cast<const parameter *>(passign_lhs);
+            if (lp && lp->Typespec() && lp->Typespec()->Actual_typespec()) {
+              ref_typespec *rt0 = s.MakeRef_typespec();
+              rt0->Actual_typespec(
+                  (typespec *)lp->Typespec()->Actual_typespec());
+              rt0->VpiParent(op0);
+              op0->Typespec(rt0);
+            }
+          }
+        }
+      }
     }
   }
   if (object == nullptr) {
@@ -2383,6 +2697,21 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
         }
       }
       return nullptr;
+    }
+    // A fully-selected element that is still an assignment-pattern operation
+    // (e.g. `'{default: PARALLEL}` picked by `Implementation.UnitTypes[k]`)
+    // must reduce to a constant for VALUE consumers; fold it against its
+    // typespec when known.
+    if (returnType == ReturnType::VALUE) {
+      if (operation *fop = any_cast<operation *>(object)) {
+        if (fop->VpiOpType() == vpiAssignmentPatternOp && fop->Typespec() &&
+            fop->Typespec()->Actual_typespec()) {
+          if (constant *fc = foldPatternToConstant(
+                  fop, fop->Typespec()->Actual_typespec(), this, s, inst,
+                  pexpr, muteError))
+            return fc;
+        }
+      }
     }
     return (expr *)object;
   }
@@ -2821,12 +3150,137 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
       int32_t opType = oper->VpiOpType();
       if (opType == vpiAssignmentPatternOp) {
         VectorOfany *operands = oper->Operands();
+        // Element typespec from the pattern's own (array) typespec — needed
+        // so the picked element can itself fold/select downstream.
+        const typespec *elemTs = nullptr;
+        if (oper->Typespec()) {
+          if (const typespec *ots = oper->Typespec()->Actual_typespec()) {
+            if (const packed_array_typespec *pt =
+                    any_cast<const packed_array_typespec *>(ots)) {
+              if (pt->Elem_typespec())
+                elemTs = pt->Elem_typespec()->Actual_typespec();
+            } else if (const array_typespec *at =
+                           any_cast<const array_typespec *>(ots)) {
+              if (at->Elem_typespec())
+                elemTs = at->Elem_typespec()->Actual_typespec();
+            } else if (const logic_typespec *lt =
+                           any_cast<const logic_typespec *>(ots)) {
+              if (lt->Elem_typespec())
+                elemTs = lt->Elem_typespec()->Actual_typespec();
+            }
+          }
+        }
+        // Typedef-alias duplication (`typedef fmt_unsigned_t [0:3] t;`):
+        // the Elem_typespec chain repeats the OUTER range, so the element
+        // type is the chain's OWN Elem_typespec, one level deeper.
+        bool dup_stripped = false;
+        if (elemTs) {
+          if (const logic_typespec *elt =
+                  any_cast<const logic_typespec *>(elemTs)) {
+            if (elt->Elem_typespec() &&
+                elt->Elem_typespec()->Actual_typespec() && elt->Ranges() &&
+                !elt->Ranges()->empty()) {
+              elemTs = elt->Elem_typespec()->Actual_typespec();
+              dup_stripped = true;
+            }
+          }
+        }
+        // Guard against Surelog's typedef-alias duplication: the
+        // Elem_typespec can point at a typespec that repeats the OUTER
+        // geometry.  Validate size(elem) * n == size(whole); if not,
+        // synthesize a plain logic typespec of the true element width.
+        if (!dup_stripped && elemTs && oper->Typespec() &&
+            oper->Typespec()->Actual_typespec()) {
+          const typespec *ots0 = oper->Typespec()->Actual_typespec();
+          VectorOfrange *org = nullptr;
+          if (const packed_array_typespec *pt0 =
+                  any_cast<const packed_array_typespec *>(ots0))
+            org = pt0->Ranges();
+          else if (const array_typespec *at0 =
+                       any_cast<const array_typespec *>(ots0))
+            org = at0->Ranges();
+          else if (const logic_typespec *lt0 =
+                       any_cast<const logic_typespec *>(ots0))
+            org = lt0->Ranges();
+          if (org && !org->empty()) {
+            bool giv = false;
+            int64_t gl = get_value(
+                giv, reduceExpr((any *)org->at(0)->Left_expr(), giv, inst,
+                                pexpr, muteError));
+            int64_t gr = get_value(
+                giv, reduceExpr((any *)org->at(0)->Right_expr(), giv, inst,
+                                pexpr, muteError));
+            uint64_t gn =
+                giv ? 0 : (uint64_t)(gl > gr ? gl - gr + 1 : gr - gl + 1);
+            bool wiv = false;
+            uint64_t ww = size(ots0, wiv, inst, pexpr, true, muteError);
+            bool eiv2 = false;
+            uint64_t ew0 = size(elemTs, eiv2, inst, pexpr, true, muteError);
+            if (!wiv && gn > 0 && (ww % gn) == 0) {
+              uint64_t exp_ew = ww / gn;
+              if (eiv2 || ew0 != exp_ew) {
+                logic_typespec *sub0 = s.MakeLogic_typespec();
+                VectorOfrange *sr = s.MakeRangeVec();
+                range *rg = s.MakeRange();
+                constant *cl = s.MakeConstant();
+                cl->VpiValue("INT:" + std::to_string((int64_t)exp_ew - 1));
+                cl->VpiSize(64);
+                cl->VpiConstType(vpiIntConst);
+                constant *cr = s.MakeConstant();
+                cr->VpiValue("INT:0");
+                cr->VpiSize(64);
+                cr->VpiConstType(vpiIntConst);
+                rg->Left_expr(cl);
+                rg->Right_expr(cr);
+                sr->push_back(rg);
+                sub0->Ranges(sr);
+                elemTs = sub0;
+              }
+            }
+          }
+        }
+        auto tagElem = [&](any *picked) -> any * {
+          if (!picked || !elemTs) return picked;
+          // Tag a CLONE, never the shared node: the picked element belongs
+          // to a persisted pattern shared by every consumer, and mutating
+          // its typespec re-types unrelated reads
+          // (compressed_instr_decoder's CoproInstr constants).  Only an
+          // untyped OPERATION needs the tag — it feeds the final
+          // pattern-fold (fpnew's `'{default: PARALLEL}` element).
+          if (picked->UhdmType() == UHDM_OBJECT_TYPE::uhdmoperation &&
+              ((operation *)picked)->Typespec() == nullptr) {
+            ElaboratorContext elabCtx(&s, false, true);
+            if (any *cl = clone_tree(picked, &elabCtx)) {
+              operation *pop = (operation *)cl;
+              ref_typespec *rt = s.MakeRef_typespec();
+              rt->Actual_typespec((typespec *)elemTs);
+              rt->VpiParent(pop);
+              pop->Typespec(rt);
+              return cl;
+            }
+          }
+          return picked;
+        };
+        // `'{default: v}` — every element is the default value.
+        if (operands && operands->size() == 1 &&
+            operands->at(0)->UhdmType() ==
+                UHDM_OBJECT_TYPE::uhdmtagged_pattern) {
+          tagged_pattern *tp0 = (tagged_pattern *)operands->at(0);
+          const typespec *tts =
+              tp0->Typespec() ? tp0->Typespec()->Actual_typespec() : nullptr;
+          if (tts && tts->VpiName() == "default" && selectIndex >= 0) {
+            return hierarchicalSelector(select_path, level + 1,
+                                        tagElem((any *)tp0->Pattern()),
+                                        invalidValue, inst, pexpr, returnType,
+                                        muteError);
+          }
+        }
         int32_t sInd = 0;
         for (auto operand : *operands) {
           if ((selectIndex >= 0) && (sInd == selectIndex)) {
-            return hierarchicalSelector(select_path, level + 1, operand,
-                                        invalidValue, inst, pexpr,
-                                        returnType, muteError);
+            return hierarchicalSelector(select_path, level + 1,
+                                        tagElem(operand), invalidValue, inst,
+                                        pexpr, returnType, muteError);
           }
           sInd++;
         }
@@ -2858,10 +3312,96 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
       // the whole element, not bit N (fpnew_top's
       // `Implementation.UnitTypes[opgrp]` was stamped with single bits
       // tracking the genvar, poisoning paramod uniquification, constant
-      // folding and generate elaboration downstream).
+      // folding and generate elaboration downstream).  A pattern-member
+      // constant often carries NO typespec (a >64-bit struct resolves
+      // through the complex-value pattern, whose members are bare) — derive
+      // the expected type by walking the select path from the base
+      // parameter's typespec.
+      const typespec *walk_ts = nullptr;
+      if ((c->Typespec() == nullptr ||
+           c->Typespec()->Actual_typespec() == nullptr) &&
+          inst && level >= 1) {
+        const typespec *tps = nullptr;
+        // The base may be a PACKAGE parameter — resolve through the same
+        // functor chain decodeHierPath uses.
+        if (any *bobj = getObject(select_path[0], inst, pexpr, muteError)) {
+          if (param_assign *bpa = any_cast<param_assign *>(bobj))
+            bobj = (any *)bpa->Lhs();
+          if (const parameter *bp = any_cast<const parameter *>(bobj))
+            if (bp->Typespec()) tps = bp->Typespec()->Actual_typespec();
+        }
+        std::string_view baseName = select_path[0];
+        size_t cpos = baseName.rfind("::");
+        if (cpos != std::string_view::npos) baseName.remove_prefix(cpos + 2);
+        const any *tmpi = inst;
+        while (!tps && tmpi) {
+          VectorOfparam_assign *pas = nullptr;
+          if (tmpi->UhdmType() == UHDM_OBJECT_TYPE::uhdmgen_scope_array) {
+          } else if (tmpi->UhdmType() == UHDM_OBJECT_TYPE::uhdmdesign) {
+            pas = ((design *)tmpi)->Param_assigns();
+          } else if (const scope *spe = any_cast<const scope *>(tmpi)) {
+            pas = spe->Param_assigns();
+          }
+          if (pas) {
+            for (param_assign *pa : *pas) {
+              if (!pa->Lhs()) continue;
+              std::string_view ln = pa->Lhs()->VpiName();
+              size_t lpos = ln.rfind("::");
+              if (lpos != std::string_view::npos) ln.remove_prefix(lpos + 2);
+              if (ln == baseName || pa->Lhs()->VpiName() == select_path[0]) {
+                if (const parameter *p =
+                        any_cast<const parameter *>(pa->Lhs()))
+                  if (p->Typespec())
+                    tps = p->Typespec()->Actual_typespec();
+                break;
+              }
+            }
+          }
+          tmpi = tmpi->VpiParent();
+        }
+        const typespec *cur = tps;
+        auto unwrapA = [](const typespec *t) -> const typespec * {
+          if (t->UhdmType() == UHDM_OBJECT_TYPE::uhdmpacked_array_typespec) {
+            if (const ref_typespec *rt =
+                    ((packed_array_typespec *)t)->Elem_typespec())
+              return rt->Actual_typespec();
+            return nullptr;
+          } else if (t->UhdmType() == UHDM_OBJECT_TYPE::uhdmarray_typespec) {
+            if (const ref_typespec *rt =
+                    ((array_typespec *)t)->Elem_typespec())
+              return rt->Actual_typespec();
+            return nullptr;
+          }
+          return t;
+        };
+        for (uint32_t wl = 1; wl < level && cur; wl++) {
+          const std::string &tok = select_path[wl];
+          if (!tok.empty() && tok[0] == '[') {
+            const typespec *nxt = unwrapA(cur);
+            cur = (nxt == cur) ? nullptr : nxt;
+          } else {
+            const struct_typespec *st =
+                (cur->UhdmType() == UHDM_OBJECT_TYPE::uhdmstruct_typespec)
+                    ? (const struct_typespec *)cur
+                    : nullptr;
+            const typespec *next = nullptr;
+            if (st && st->Members()) {
+              for (typespec_member *member : *st->Members()) {
+                if (member->VpiName() == tok) {
+                  if (const ref_typespec *mrt = member->Typespec())
+                    next = mrt->Actual_typespec();
+                  break;
+                }
+              }
+            }
+            cur = next;
+          }
+        }
+        walk_ts = cur;
+      }
       if (constant *ec = reducePackedElemSelect(c, selectIndex, this, s,
                                                 invalidValue, inst, pexpr,
-                                                muteError)) {
+                                                muteError, walk_ts)) {
         if (lastElem) {
           if (returnType == ReturnType::TYPESPEC) {
             if (ref_typespec *rt = ec->Typespec()) return rt->Actual_typespec();
@@ -3099,6 +3639,32 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
             if (pattType == UHDM_OBJECT_TYPE::uhdmconstant) {
               any *ex = reduceExpr((expr *)patt, invalidValue, inst, pexpr,
                                    muteError);
+              // Attach the member's TRUE typespec to the pattern's folded
+              // constant: it usually carries none (and can carry a
+              // mis-recorded size), so a following `[N]` bit-selected
+              // instead of element-selecting (fpnew's
+              // `Implementation.UnitTypes[opgrp]`).
+              if (constant *exc = any_cast<constant *>(ex)) {
+                if (exc->Typespec() == nullptr) {
+                  const struct_typespec *stps2 = nullptr;
+                  if (const expr *oe = any_cast<const expr *>(object))
+                    if (oe->Typespec())
+                      stps2 = any_cast<const struct_typespec *>(
+                          oe->Typespec()->Actual_typespec());
+                  if (stps2 && stps2->Members()) {
+                    for (typespec_member *m2 : *stps2->Members()) {
+                      if (m2->VpiName() == elemName && m2->Typespec()) {
+                        ref_typespec *rt2 = s.MakeRef_typespec();
+                        rt2->Actual_typespec(
+                            (typespec *)m2->Typespec()->Actual_typespec());
+                        rt2->VpiParent(exc);
+                        exc->Typespec(rt2);
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
               if (level < select_path.size()) {
                 ex = hierarchicalSelector(select_path, level + 1, ex,
                                           invalidValue, inst, pexpr,
@@ -3130,6 +3696,16 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
               }
               return ex;
             } else if (pattType == UHDM_OBJECT_TYPE::uhdmoperation) {
+              // Tag the member's pattern with the member typespec (the
+              // tagged_pattern's typespec IS the member type) so nested
+              // `[N]` selects and final folding know the geometry.
+              operation *patt_op = (operation *)patt;
+              if (patt_op->Typespec() == nullptr && tps) {
+                ref_typespec *rt3 = s.MakeRef_typespec();
+                rt3->Actual_typespec((typespec *)tps);
+                rt3->VpiParent(patt_op);
+                patt_op->Typespec(rt3);
+              }
               return hierarchicalSelector(select_path, level + 1, (expr *)patt,
                                           invalidValue, inst, pexpr,
                                           returnType);
@@ -3160,6 +3736,18 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
           // parameter's value comes from a package localparam whose clone lost
           // the tagged-pattern member names, leaving a purely positional tree.
           if ((bIndex >= 0) && (bIndex == sInd)) {
+            // Tag the member's value with its declared typespec so nested
+            // `[N]` selects and final pattern folding know the geometry
+            // (fpnew's Implementation.UnitTypes[opgrp]).
+            if (bMemberTs) {
+              operation *oop = (operation *)operand;
+              if (oop->Typespec() == nullptr) {
+                ref_typespec *ort = s.MakeRef_typespec();
+                ort->Actual_typespec((typespec *)bMemberTs);
+                ort->VpiParent(oop);
+                oop->Typespec(ort);
+              }
+            }
             return hierarchicalSelector(select_path, level + 1, operand,
                                         invalidValue, inst, pexpr, returnType);
           }
@@ -5116,6 +5704,14 @@ expr *ExprEval::reduceExpr(const any *result, bool &invalidValue,
           object = (any *)passign->Rhs();
         }
       }
+      // A function FORMAL (io_decl) shadows its staged argument value in the
+      // pexpr task_func chain; the formal carries no value, so resolve the
+      // name through the value store instead (fpnew's
+      // `cfg[fmt]` inside get_conv_lane_formats).
+      if (object && object->UhdmType() == UHDM_OBJECT_TYPE::uhdmio_decl) {
+        if (any *valobj = getValue(name, inst, pexpr, muteError))
+          object = valobj;
+      }
       if (object == nullptr) {
         object = getValue(name, inst, pexpr, muteError);
       }
@@ -5723,12 +6319,50 @@ bool ExprEval::setValueInInstance(
           int64_t size_rhs = ((constant *)rhsexp)->VpiSize();
           if ((wordSize != 1) && (((int64_t)wordSize) < size_rhs))
             size_rhs = wordSize;
+          // Plain 1-D vector target: each bit-select writes exactly ONE
+          // bit, positioned per the declared range (an ascending [0:N]
+          // range puts index 0 at the MSB).  Without this, a folded RHS
+          // (a UINT from `&&`/compare, VpiSize 64) landed only index 0
+          // and spilled past the vector for every other index, and
+          // ascending vectors wrote mirrored bit positions (fpnew's
+          // `res[fmt] = cfg[fmt] && ...` in get_conv_lane_formats).
+          uint64_t windex = index;
+          {
+            VectorOfrange *wrgs = nullptr;
+            if (tps) {
+              if (tps->UhdmType() == UHDM_OBJECT_TYPE::uhdmlogic_typespec) {
+                auto *lt = (const logic_typespec *)tps;
+                if (!lt->Elem_typespec()) wrgs = lt->Ranges();
+              } else if (tps->UhdmType() ==
+                         UHDM_OBJECT_TYPE::uhdmbit_typespec) {
+                wrgs = ((const bit_typespec *)tps)->Ranges();
+              } else if (tps->UhdmType() ==
+                         UHDM_OBJECT_TYPE::uhdmint_typespec) {
+                wrgs = ((const int_typespec *)tps)->Ranges();
+              }
+            }
+            if (wrgs && wrgs->size() == 1) {
+              bool rinv = false;
+              int64_t wl = get_value(
+                  rinv, reduceExpr(wrgs->at(0)->Left_expr(), rinv, inst,
+                                   lhsexp, muteError));
+              int64_t wr = get_value(
+                  rinv, reduceExpr(wrgs->at(0)->Right_expr(), rinv, inst,
+                                   lhsexp, muteError));
+              if (!rinv) {
+                size_rhs = 1;
+                int64_t wi = (wl < wr) ? (wr - (int64_t)index)
+                                       : ((int64_t)index - wr);
+                windex = (wi < 0) ? (uint64_t)si : (uint64_t)wi;
+              }
+            }
+          }
           std::string tobinary = NumUtils::toBinary(size_rhs, valUI);
           std::reverse(tobinary.begin(), tobinary.end());
           for (int32_t i = 0; i < size_rhs; i++) {
-            if ((((index * size_rhs) + i) < si) &&
-                (((index * size_rhs) + i) < lhsbinary.size())) {
-              lhsbinary[(index * size_rhs) + i] = tobinary[i];
+            if ((((windex * size_rhs) + i) < si) &&
+                (((windex * size_rhs) + i) < lhsbinary.size())) {
+              lhsbinary[(windex * size_rhs) + i] = tobinary[i];
             }
           }
           std::reverse(lhsbinary.begin(), lhsbinary.end());
